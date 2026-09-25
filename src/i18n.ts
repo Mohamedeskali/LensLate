@@ -1,8 +1,13 @@
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
 
+const systemLanguage = (): "ar" | "en" =>
+  (navigator.languages[0] ?? navigator.language).toLowerCase().startsWith("ar")
+    ? "ar"
+    : "en";
+
 void i18n.use(initReactI18next).init({
-  lng: navigator.language.toLowerCase().startsWith("ar") ? "ar" : "en",
+  lng: systemLanguage(),
   fallbackLng: "en",
   resources: {
     en: {
