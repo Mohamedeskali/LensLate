@@ -29,11 +29,19 @@ function App() {
   const windowHandle = getCurrentWindow();
 
   const startResize = (direction: ResizeDirection) => {
-    void windowHandle.startResizeDragging(direction);
+    void windowHandle.startResizeDragging(direction).catch((error: unknown) => {
+      void invoke("log_frontend_error", {
+        message: `startResizeDragging(${direction}) failed: ${String(error)}`,
+      });
+    });
   };
 
   const startMove = () => {
-    void windowHandle.startDragging();
+    void windowHandle.startDragging().catch((error: unknown) => {
+      void invoke("log_frontend_error", {
+        message: `startDragging failed: ${String(error)}`,
+      });
+    });
   };
 
   useEffect(() => {
@@ -141,9 +149,18 @@ function App() {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onMouseDown={(event) => {
-        if (event.button === 0 && event.target === event.currentTarget)
+        const target = event.target as HTMLElement;
+        if (
+          event.button === 0 &&
+          !target.closest(".resize-zone") &&
+          !target.closest("button")
+        )
           event.preventDefault();
-        if (event.button === 0 && event.target === event.currentTarget)
+        if (
+          event.button === 0 &&
+          !target.closest(".resize-zone") &&
+          !target.closest("button")
+        )
           startMove();
       }}
     >

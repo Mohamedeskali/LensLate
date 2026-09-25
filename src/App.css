@@ -43,22 +43,22 @@ body {
 }
 .resize-n,
 .resize-s {
-  inset-inline: 8px;
-  height: 10px;
+  inset-inline: 12px;
+  height: 12px;
 }
 .resize-n {
-  top: 5px;
+  top: 0;
   cursor: ns-resize;
 }
 .resize-s {
-  bottom: 37px;
+  bottom: 30px;
   cursor: ns-resize;
 }
 .resize-e,
 .resize-w {
-  top: 15px;
-  bottom: 47px;
-  width: 10px;
+  top: 12px;
+  bottom: 42px;
+  width: 12px;
 }
 .resize-e {
   inset-inline-end: 0;
@@ -76,22 +76,22 @@ body {
   height: 14px;
 }
 .resize-ne {
-  top: 3px;
+  top: 0;
   inset-inline-end: 0;
   cursor: nesw-resize;
 }
 .resize-nw {
-  top: 3px;
+  top: 0;
   inset-inline-start: 0;
   cursor: nwse-resize;
 }
 .resize-se {
-  bottom: 35px;
+  bottom: 28px;
   inset-inline-end: 0;
   cursor: nwse-resize;
 }
 .resize-sw {
-  bottom: 35px;
+  bottom: 28px;
   inset-inline-start: 0;
   cursor: nesw-resize;
 }

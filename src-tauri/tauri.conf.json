@@ -10,7 +10,22 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [],
+    "windows": [
+      {
+        "label": "frame",
+        "url": "index.html?view=frame",
+        "visible": false,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "width": 480,
+        "height": 160,
+        "minWidth": 120,
+        "minHeight": 60
+      }
+    ],
     "security": {
       "csp": null
     }

@@ -78,6 +78,11 @@ fn open_settings(app: AppHandle) {
     show_utility(&app, "settings", "LensLate Settings");
 }
 
+#[tauri::command]
+fn log_frontend_error(message: String) {
+    eprintln!("[lenslate] {message}");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -88,6 +93,12 @@ pub fn run() {
         // Prefer XWayland for the transparent frame when running under Wayland.
         std::env::set_var("GDK_BACKEND", "x11");
     }
+    eprintln!(
+        "[lenslate] GDK_BACKEND={}, WAYLAND_DISPLAY={}, DISPLAY={}",
+        std::env::var("GDK_BACKEND").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".into()),
+    );
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
     let shortcut_for_handler = shortcut;
     tauri::Builder::default()
@@ -98,10 +109,10 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let frame = WebviewWindowBuilder::new(app, "frame", WebviewUrl::App("index.html?view=frame".into()))
-                .title("LensLate").inner_size(480.0, 160.0).min_inner_size(120.0, 60.0)
-                .decorations(false).transparent(true).always_on_top(true).skip_taskbar(true)
-                .visible(false).resizable(true).build()?;
+            let frame = app.get_webview_window("frame").ok_or_else(|| {
+                tauri::Error::WindowNotFound
+            })?;
+            let _ = frame.set_title("LensLate");
             let _ = frame.set_shadow(false);
             let _ = app.global_shortcut().register(shortcut);
             if std::env::args().any(|arg| arg == "--toggle") { toggle_frame(app.handle()); }
@@ -110,7 +121,7 @@ pub fn run() {
             eprintln!("XDG GlobalShortcuts portal unavailable through Tauri; use lenslate --toggle with a GNOME custom shortcut.");
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![toggle_frame_command, open_settings])
+        .invoke_handler(tauri::generate_handler![toggle_frame_command, open_settings, log_frontend_error])
         .run(tauri::generate_context!())
         .expect("error while running LensLate");
 }
