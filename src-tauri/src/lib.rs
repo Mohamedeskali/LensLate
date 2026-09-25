@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::image::Image;
+use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
@@ -40,15 +41,17 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "Show / Hide frame", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let history = MenuItem::with_id(app, "history", "History", true, None::<&str>)?;
-    let quit = PredefinedMenuItem::quit(app, Some("Quit"))?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&toggle, &settings, &history, &quit])?;
     TrayIconBuilder::new()
+        .icon(Image::from_bytes(include_bytes!("../icons/icon.png"))?)
         .menu(&menu)
         .tooltip("LensLate")
         .on_menu_event(|app, event| match event.id().as_ref() {
             "toggle" => toggle_frame(app),
             "settings" => show_utility(app, "settings", "LensLate Settings"),
             "history" => show_utility(app, "history", "LensLate History"),
+            "quit" => app.exit(0),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -77,23 +80,24 @@ fn open_settings(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyT);
+    let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
+    let shortcut_for_handler = shortcut;
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| toggle_frame(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, pressed, event| {
-            if pressed == &shortcut && event.state() == ShortcutState::Pressed { toggle_frame(app); }
+            if pressed == &shortcut_for_handler && event.state() == ShortcutState::Pressed { toggle_frame(app); }
         }).build())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             let frame = WebviewWindowBuilder::new(app, "frame", WebviewUrl::App("index.html?view=frame".into()))
-                .title("LensLate").inner_size(560.0, 280.0).min_inner_size(240.0, 140.0)
+                .title("LensLate").inner_size(560.0, 280.0).min_inner_size(120.0, 60.0)
                 .decorations(false).transparent(true).always_on_top(true).skip_taskbar(true)
                 .visible(false).resizable(true).build()?;
             let _ = frame.set_shadow(false);
             let _ = app.global_shortcut().register(shortcut);
-            if std::env::args().any(|arg| arg == "--toggle") { toggle_frame(&app.handle()); }
-            if let Err(error) = create_tray(&app.handle()) { eprintln!("Could not create tray icon: {error}"); }
+            if std::env::args().any(|arg| arg == "--toggle") { toggle_frame(app.handle()); }
+            if let Err(error) = create_tray(app.handle()) { eprintln!("Could not create tray icon: {error}"); }
             #[cfg(target_os = "linux")]
             eprintln!("XDG GlobalShortcuts portal unavailable through Tauri; use lenslate --toggle with a GNOME custom shortcut.");
             Ok(())
