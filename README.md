@@ -13,6 +13,8 @@ pnpm install
 pnpm tauri dev
 ```
 
-The frame is opened from the tray menu or with `Ctrl+Alt+T` where global shortcuts are supported. On GNOME Wayland, open **Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts**, add `lenslate --toggle` as the command, and assign a key combination. The CLI flag is forwarded to the running instance.
+The frame is opened from the tray menu or with `Ctrl+Alt+Y` where global shortcuts are supported. On GNOME Wayland, open **Settings > Keyboard > View and Customize Shortcuts > Custom Shortcuts**, add `lenslate --toggle` as the command, and assign `Ctrl+Alt+Y`. The CLI flag is forwarded to the running instance.
+
+On Wayland, the transparent interior is not click-through in this phase. Tauri's cursor-event setting applies to the entire transparent window, so enabling it would also make the border, toolbar, and translation bar unclickable; per-region hit testing requires compositor/native support not available through the current Tauri API. The frame therefore remains interactive as a documented limitation.
 
 Run `pnpm lint`, `pnpm format:check`, `pnpm build`, `cargo fmt --check --manifest-path src-tauri/Cargo.toml`, and `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` for checks.
