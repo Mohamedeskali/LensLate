@@ -45,6 +45,20 @@ function App() {
   }, [view]);
 
   useEffect(() => {
+    let disposed = false;
+    const applyTheme = (theme: "light" | "dark" | null) => {
+      if (!disposed) document.documentElement.dataset.theme = theme ?? "light";
+    };
+
+    void windowHandle.theme().then(applyTheme);
+    const unlisten = windowHandle.onThemeChanged(({ payload }) => applyTheme(payload));
+    return () => {
+      disposed = true;
+      void unlisten.then((stop) => stop());
+    };
+  }, [windowHandle]);
+
+  useEffect(() => {
     if (view !== "frame") return;
 
     let disposed = false;
