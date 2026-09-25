@@ -88,7 +88,11 @@ function App() {
         await windowHandle.setSize(new PhysicalSize(saved.width, saved.height));
       }
       if (saved.x !== undefined && saved.y !== undefined) {
-        await windowHandle.setPosition(new PhysicalPosition(saved.x, saved.y));
+        try {
+          await windowHandle.setPosition(new PhysicalPosition(saved.x, saved.y));
+        } catch {
+          // Wayland compositors may reject application-controlled positioning.
+        }
       }
     })();
 
@@ -96,6 +100,7 @@ function App() {
     const unlistenMove = windowHandle.onMoved(() => void persistGeometry());
     return () => {
       disposed = true;
+      void persistGeometry();
       void unlistenResize.then((unlisten) => unlisten());
       void unlistenMove.then((unlisten) => unlisten());
     };
