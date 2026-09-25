@@ -46,16 +46,28 @@ body {
   inset-inline: 8px;
   height: 10px;
 }
-.resize-n { top: 5px; cursor: ns-resize; }
-.resize-s { bottom: 37px; cursor: ns-resize; }
+.resize-n {
+  top: 5px;
+  cursor: ns-resize;
+}
+.resize-s {
+  bottom: 37px;
+  cursor: ns-resize;
+}
 .resize-e,
 .resize-w {
   top: 15px;
   bottom: 47px;
   width: 10px;
 }
-.resize-e { inset-inline-end: 0; cursor: ew-resize; }
-.resize-w { inset-inline-start: 0; cursor: ew-resize; }
+.resize-e {
+  inset-inline-end: 0;
+  cursor: ew-resize;
+}
+.resize-w {
+  inset-inline-start: 0;
+  cursor: ew-resize;
+}
 .resize-ne,
 .resize-nw,
 .resize-se,
@@ -63,10 +75,26 @@ body {
   width: 14px;
   height: 14px;
 }
-.resize-ne { top: 3px; inset-inline-end: 0; cursor: nesw-resize; }
-.resize-nw { top: 3px; inset-inline-start: 0; cursor: nwse-resize; }
-.resize-se { bottom: 35px; inset-inline-end: 0; cursor: nwse-resize; }
-.resize-sw { bottom: 35px; inset-inline-start: 0; cursor: nesw-resize; }
+.resize-ne {
+  top: 3px;
+  inset-inline-end: 0;
+  cursor: nesw-resize;
+}
+.resize-nw {
+  top: 3px;
+  inset-inline-start: 0;
+  cursor: nwse-resize;
+}
+.resize-se {
+  bottom: 35px;
+  inset-inline-end: 0;
+  cursor: nwse-resize;
+}
+.resize-sw {
+  bottom: 35px;
+  inset-inline-start: 0;
+  cursor: nesw-resize;
+}
 .frame-outline {
   position: absolute;
   inset: 10px 0 42px;

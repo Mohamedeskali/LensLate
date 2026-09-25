@@ -34,5 +34,6 @@ jobs:
       - run: pnpm format:check
       - run: pnpm build
       - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+      - run: cargo check --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
       - run: pnpm tauri build

@@ -51,7 +51,9 @@ function App() {
     };
 
     void windowHandle.theme().then(applyTheme);
-    const unlisten = windowHandle.onThemeChanged(({ payload }) => applyTheme(payload));
+    const unlisten = windowHandle.onThemeChanged(({ payload }) =>
+      applyTheme(payload),
+    );
     return () => {
       disposed = true;
       void unlisten.then((stop) => stop());
@@ -89,7 +91,9 @@ function App() {
       }
       if (saved.x !== undefined && saved.y !== undefined) {
         try {
-          await windowHandle.setPosition(new PhysicalPosition(saved.x, saved.y));
+          await windowHandle.setPosition(
+            new PhysicalPosition(saved.x, saved.y),
+          );
         } catch {
           // Wayland compositors may reject application-controlled positioning.
         }
@@ -120,17 +124,42 @@ function App() {
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onMouseDown={(event) => {
-        if (event.button === 0 && event.target === event.currentTarget) startMove();
+        if (event.button === 0 && event.target === event.currentTarget)
+          startMove();
       }}
     >
-      <div className="resize-zone resize-n" onMouseDown={() => startResize("North")} />
-      <div className="resize-zone resize-ne" onMouseDown={() => startResize("NorthEast")} />
-      <div className="resize-zone resize-e" onMouseDown={() => startResize("East")} />
-      <div className="resize-zone resize-se" onMouseDown={() => startResize("SouthEast")} />
-      <div className="resize-zone resize-s" onMouseDown={() => startResize("South")} />
-      <div className="resize-zone resize-sw" onMouseDown={() => startResize("SouthWest")} />
-      <div className="resize-zone resize-w" onMouseDown={() => startResize("West")} />
-      <div className="resize-zone resize-nw" onMouseDown={() => startResize("NorthWest")} />
+      <div
+        className="resize-zone resize-n"
+        onMouseDown={() => startResize("North")}
+      />
+      <div
+        className="resize-zone resize-ne"
+        onMouseDown={() => startResize("NorthEast")}
+      />
+      <div
+        className="resize-zone resize-e"
+        onMouseDown={() => startResize("East")}
+      />
+      <div
+        className="resize-zone resize-se"
+        onMouseDown={() => startResize("SouthEast")}
+      />
+      <div
+        className="resize-zone resize-s"
+        onMouseDown={() => startResize("South")}
+      />
+      <div
+        className="resize-zone resize-sw"
+        onMouseDown={() => startResize("SouthWest")}
+      />
+      <div
+        className="resize-zone resize-w"
+        onMouseDown={() => startResize("West")}
+      />
+      <div
+        className="resize-zone resize-nw"
+        onMouseDown={() => startResize("NorthWest")}
+      />
       <div className="frame-outline" aria-hidden="true" />
       <nav
         className={`toolbar${hovered ? " toolbar-visible" : ""}`}
