@@ -70,6 +70,11 @@ fn toggle_frame_command(app: AppHandle) {
     toggle_frame(&app);
 }
 
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    show_utility(&app, "settings", "LensLate Settings");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyT);
@@ -93,7 +98,7 @@ pub fn run() {
             eprintln!("XDG GlobalShortcuts portal unavailable through Tauri; use lenslate --toggle with a GNOME custom shortcut.");
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![toggle_frame_command])
+        .invoke_handler(tauri::generate_handler![toggle_frame_command, open_settings])
         .run(tauri::generate_context!())
         .expect("error while running LensLate");
 }

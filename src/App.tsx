@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import { useTranslation } from "react-i18next";
 import "./App.css";
 
@@ -57,7 +58,7 @@ function App() {
         <button
           title={t("settings")}
           aria-label={t("settings")}
-          onClick={() => window.open("index.html?view=settings")}
+          onClick={() => void invoke("open_settings")}
         >
           ⚙
         </button>
