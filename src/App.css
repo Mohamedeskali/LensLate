@@ -1,116 +1,106 @@
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafb);
-}
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
+  font-family: Inter, "Segoe UI", sans-serif;
+  color: #202421;
+  background: transparent;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+  color-scheme: light dark;
 }
 
-.container {
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
   margin: 0;
-  padding-top: 10vh;
+  overflow: hidden;
+}
+body {
+  background: transparent;
+}
+.frame-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  padding: 10px 0 42px;
+}
+.frame-outline {
+  position: absolute;
+  inset: 10px 0 42px;
+  border: 2px solid #18a999;
+  border-radius: 9px;
+  pointer-events: none;
+}
+.toolbar {
+  position: absolute;
+  inset-inline-end: 12px;
+  top: 0;
   display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+  border-radius: 6px;
+  background: Canvas;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
 }
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
+.toolbar-visible {
+  opacity: 1;
+  transform: translateY(0);
 }
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
+.toolbar button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: CanvasText;
+  background: transparent;
+  font: inherit;
   cursor: pointer;
 }
-
-button:hover {
-  border-color: #396cd8;
+.toolbar button:hover {
+  background: color-mix(in srgb, CanvasText 10%, transparent);
 }
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.translation-bar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+  border-radius: 6px;
+  color: CanvasText;
+  background: color-mix(in srgb, Canvas 92%, transparent);
+  font-size: 13px;
 }
-
-input,
-button {
-  outline: none;
+.utility {
+  height: 100%;
+  padding: 24px;
+  color: CanvasText;
+  background: Canvas;
 }
-
-#greet-input {
-  margin-right: 5px;
+.utility h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
 }
-
 @media (prefers-color-scheme: dark) {
   :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+    color: #edf2ef;
   }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
+  .frame-outline {
+    border-color: #63d4b8;
   }
 }

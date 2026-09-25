@@ -1,49 +1,75 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useTranslation } from "react-i18next";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const { t, i18n } = useTranslation();
+  const [hovered, setHovered] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const view = new URLSearchParams(window.location.search).get("view");
+  const windowHandle = getCurrentWindow();
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  useEffect(() => {
+    document.documentElement.lang = i18n.language;
+    document.documentElement.dir = i18n.language === "ar" ? "rtl" : "ltr";
+  }, [i18n.language]);
+
+  useEffect(() => {
+    if (view && view !== "frame") document.body.dataset.view = view;
+  }, [view]);
+
+  if (view === "settings" || view === "history") {
+    return (
+      <main className="utility">
+        <h1>{view === "settings" ? t("settings") : t("history")}</h1>
+      </main>
+    );
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
+    <main
+      className="frame-shell"
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
+      <div className="frame-outline" aria-hidden="true" />
+      <nav
+        className={`toolbar${hovered ? " toolbar-visible" : ""}`}
+        aria-label={t("toolbar")}
       >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+        <button
+          title={t("language")}
+          aria-label={t("language")}
+          onClick={() =>
+            void i18n.changeLanguage(i18n.language === "en" ? "ar" : "en")
+          }
+        >
+          文
+        </button>
+        <button
+          title={paused ? t("resume") : t("pause")}
+          aria-label={paused ? t("resume") : t("pause")}
+          onClick={() => setPaused(!paused)}
+        >
+          {paused ? "▶" : "Ⅱ"}
+        </button>
+        <button
+          title={t("settings")}
+          aria-label={t("settings")}
+          onClick={() => window.open("index.html?view=settings")}
+        >
+          ⚙
+        </button>
+        <button
+          title={t("close")}
+          aria-label={t("close")}
+          onClick={() => void windowHandle.hide()}
+        >
+          ×
+        </button>
+      </nav>
+      <div className="translation-bar">{t("translationPlaceholder")}</div>
     </main>
   );
 }

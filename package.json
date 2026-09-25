@@ -1,5 +1,5 @@
 {
-  "name": "tauri-app",
+  "name": "lenslate",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,13 +7,20 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-global-shortcut": "^2",
+    "@tauri-apps/plugin-store": "^2",
+    "i18next": "^25.5.2",
+    "react-i18next": "^15.7.3"
   },
   "devDependencies": {
     "@types/react": "^19.1.8",
@@ -21,6 +28,13 @@
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "~6.0.3",
     "vite": "^8.0.16",
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "^2",
+    "@eslint/js": "^9.37.0",
+    "@types/node": "^24.5.2",
+    "eslint": "^9.37.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^16.4.0",
+    "prettier": "^3.6.2",
+    "typescript-eslint": "^8.44.1"
   }
 }
