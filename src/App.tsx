@@ -24,7 +24,6 @@ const geometryStore = new LazyStore("window-state.json");
 function App() {
   const { t, i18n } = useTranslation();
   const [hovered, setHovered] = useState(false);
-  const [paused, setPaused] = useState(false);
   const view = new URLSearchParams(window.location.search).get("view");
   const windowHandle = getCurrentWindow();
 
@@ -117,22 +116,21 @@ function App() {
       <nav
         className={`toolbar${hovered ? " toolbar-visible" : ""}`}
         aria-label={t("toolbar")}
+        onMouseDown={(event) => event.stopPropagation()}
       >
         <button
           title={t("language")}
           aria-label={t("language")}
-          onClick={() =>
-            void i18n.changeLanguage(i18n.language === "en" ? "ar" : "en")
-          }
+          onClick={() => undefined}
         >
           文
         </button>
         <button
-          title={paused ? t("resume") : t("pause")}
-          aria-label={paused ? t("resume") : t("pause")}
-          onClick={() => setPaused(!paused)}
+          title={t("pause")}
+          aria-label={t("pause")}
+          onClick={() => undefined}
         >
-          {paused ? "▶" : "Ⅱ"}
+          ▶
         </button>
         <button
           title={t("settings")}
