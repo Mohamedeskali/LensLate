@@ -80,6 +80,14 @@ fn open_settings(app: AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("DISPLAY").is_some()
+        && std::env::var_os("GDK_BACKEND").is_none()
+    {
+        // Prefer XWayland for the transparent frame when running under Wayland.
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
     let shortcut_for_handler = shortcut;
     tauri::Builder::default()
@@ -91,7 +99,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let frame = WebviewWindowBuilder::new(app, "frame", WebviewUrl::App("index.html?view=frame".into()))
-                .title("LensLate").inner_size(560.0, 280.0).min_inner_size(120.0, 60.0)
+                .title("LensLate").inner_size(480.0, 160.0).min_inner_size(120.0, 60.0)
                 .decorations(false).transparent(true).always_on_top(true).skip_taskbar(true)
                 .visible(false).resizable(true).build()?;
             let _ = frame.set_shadow(false);

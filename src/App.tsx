@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  currentMonitor,
   getCurrentWindow,
   PhysicalPosition,
   PhysicalSize,
@@ -64,6 +65,39 @@ function App() {
     if (view !== "frame") return;
 
     let disposed = false;
+    const restoreGeometry = async () => {
+      const monitor = await currentMonitor();
+      const saved = await geometryStore.get<{
+        width?: number;
+        height?: number;
+        x?: number;
+        y?: number;
+      }>("frame");
+      const minWidth = 120;
+      const minHeight = 60;
+      const maxWidth = monitor
+        ? Math.max(minWidth, monitor.size.width * 0.8)
+        : 480;
+      const maxHeight = monitor
+        ? Math.max(minHeight, monitor.size.height * 0.8)
+        : 160;
+      const width = Math.min(maxWidth, Math.max(minWidth, saved?.width ?? 480));
+      const height = Math.min(
+        maxHeight,
+        Math.max(minHeight, saved?.height ?? 160),
+      );
+
+      await windowHandle.setSize(new PhysicalSize(width, height));
+      if (saved?.x !== undefined && saved.y !== undefined) {
+        try {
+          await windowHandle.setPosition(
+            new PhysicalPosition(saved.x, saved.y),
+          );
+        } catch {
+          // Wayland compositors may reject application-controlled positioning.
+        }
+      }
+    };
     const persistGeometry = async () => {
       const [size, position] = await Promise.all([
         windowHandle.innerSize(),
@@ -79,25 +113,8 @@ function App() {
     };
 
     void (async () => {
-      const saved = await geometryStore.get<{
-        width?: number;
-        height?: number;
-        x?: number;
-        y?: number;
-      }>("frame");
-      if (disposed || !saved) return;
-      if (saved.width && saved.height) {
-        await windowHandle.setSize(new PhysicalSize(saved.width, saved.height));
-      }
-      if (saved.x !== undefined && saved.y !== undefined) {
-        try {
-          await windowHandle.setPosition(
-            new PhysicalPosition(saved.x, saved.y),
-          );
-        } catch {
-          // Wayland compositors may reject application-controlled positioning.
-        }
-      }
+      if (disposed) return;
+      await restoreGeometry();
     })();
 
     const unlistenResize = windowHandle.onResized(() => void persistGeometry());
@@ -125,40 +142,74 @@ function App() {
       onMouseLeave={() => setHovered(false)}
       onMouseDown={(event) => {
         if (event.button === 0 && event.target === event.currentTarget)
+          event.preventDefault();
+        if (event.button === 0 && event.target === event.currentTarget)
           startMove();
       }}
     >
       <div
         className="resize-zone resize-n"
-        onMouseDown={() => startResize("North")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("North");
+        }}
       />
       <div
         className="resize-zone resize-ne"
-        onMouseDown={() => startResize("NorthEast")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("NorthEast");
+        }}
       />
       <div
         className="resize-zone resize-e"
-        onMouseDown={() => startResize("East")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("East");
+        }}
       />
       <div
         className="resize-zone resize-se"
-        onMouseDown={() => startResize("SouthEast")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("SouthEast");
+        }}
       />
       <div
         className="resize-zone resize-s"
-        onMouseDown={() => startResize("South")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("South");
+        }}
       />
       <div
         className="resize-zone resize-sw"
-        onMouseDown={() => startResize("SouthWest")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("SouthWest");
+        }}
       />
       <div
         className="resize-zone resize-w"
-        onMouseDown={() => startResize("West")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("West");
+        }}
       />
       <div
         className="resize-zone resize-nw"
-        onMouseDown={() => startResize("NorthWest")}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          startResize("NorthWest");
+        }}
       />
       <div className="frame-outline" aria-hidden="true" />
       <nav
