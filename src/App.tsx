@@ -5,6 +5,8 @@ import {
   PhysicalPosition,
   PhysicalSize,
 } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
+import type { Event as TauriEvent } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { LazyStore } from "@tauri-apps/plugin-store";
 import { useTranslation } from "react-i18next";
@@ -20,11 +22,26 @@ type ResizeDirection =
   | "SouthWest"
   | "West";
 
+type CaptureEvent =
+  | {
+      type: "frame";
+      thumbnailPngBase64: string;
+      width: number;
+      height: number;
+      ms: number;
+      skipped: number;
+    }
+  | { type: "error"; message: string };
+
 const geometryStore = new LazyStore("window-state.json");
 
 function App() {
   const { t, i18n } = useTranslation();
   const [hovered, setHovered] = useState(false);
+  const [live, setLive] = useState(false);
+  const [thumbnail, setThumbnail] = useState<string | null>(null);
+  const [captureInfo, setCaptureInfo] = useState<string>("");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const view = new URLSearchParams(window.location.search).get("view");
   const windowHandle = getCurrentWindow();
 
@@ -42,6 +59,43 @@ function App() {
         message: `startDragging failed: ${String(error)}`,
       });
     });
+  };
+
+  const handleCaptureOnce = async () => {
+    setErrorMsg(null);
+    try {
+      const result = await invoke<CaptureEvent>("capture_once");
+      if (result.type === "frame") {
+        setThumbnail(result.thumbnailPngBase64);
+        setCaptureInfo(
+          `${result.width}×${result.height} px · ${result.ms} ms${result.skipped ? ` · skipped ${result.skipped}` : ""}`,
+        );
+      } else {
+        setErrorMsg(t("captureError", { message: result.message }));
+        setCaptureInfo("");
+      }
+    } catch (e) {
+      setErrorMsg(t("captureError", { message: String(e) }));
+    }
+  };
+
+  const handleLiveToggle = async () => {
+    setErrorMsg(null);
+    if (!live) {
+      try {
+        await invoke("live_start");
+        setLive(true);
+      } catch (e) {
+        setErrorMsg(t("captureError", { message: String(e) }));
+      }
+    } else {
+      try {
+        await invoke("live_stop");
+        setLive(false);
+      } catch (e) {
+        setErrorMsg(t("captureError", { message: String(e) }));
+      }
+    }
   };
 
   useEffect(() => {
@@ -134,6 +188,46 @@ function App() {
       void unlistenMove.then((unlisten) => unlisten());
     };
   }, [view, windowHandle]);
+
+  // Listen for live capture events
+  useEffect(() => {
+    if (view !== "frame") return;
+
+    let unlistenFrame: (() => void) | null = null;
+    let unlistenError: (() => void) | null = null;
+
+    const setupListeners = async () => {
+      unlistenFrame = await listen<CaptureEvent>(
+        "capture://frame",
+        (event: TauriEvent<CaptureEvent>) => {
+          const payload = event.payload;
+          if (payload.type === "frame") {
+            setThumbnail(payload.thumbnailPngBase64);
+            setCaptureInfo(
+              `${payload.width}×${payload.height} px · ${payload.ms} ms${payload.skipped ? ` · skipped ${payload.skipped}` : ""}`,
+            );
+          }
+        },
+      );
+
+      unlistenError = await listen<CaptureEvent>(
+        "capture://error",
+        (event: TauriEvent<CaptureEvent>) => {
+          const payload = event.payload;
+          if (payload.type === "error") {
+            setErrorMsg(t("captureError", { message: payload.message }));
+          }
+        },
+      );
+    };
+
+    setupListeners();
+
+    return () => {
+      unlistenFrame?.();
+      unlistenError?.();
+    };
+  }, [view, t]);
 
   if (view === "settings" || view === "history") {
     return (
@@ -229,24 +323,27 @@ function App() {
         }}
       />
       <div className="frame-outline" aria-hidden="true" />
+
+      {/* Toolbar moved OUTSIDE the capture area (above the top border) */}
       <nav
         className={`toolbar${hovered ? " toolbar-visible" : ""}`}
         aria-label={t("toolbar")}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <button
-          title={t("language")}
-          aria-label={t("language")}
-          onClick={() => undefined}
+          title={t("capture")}
+          aria-label={t("capture")}
+          onClick={handleCaptureOnce}
         >
           文
         </button>
         <button
-          title={t("pause")}
-          aria-label={t("pause")}
-          onClick={() => undefined}
+          title={live ? t("pause") : t("live")}
+          aria-label={live ? t("pause") : t("live")}
+          onClick={handleLiveToggle}
+          className={live ? "live-active" : ""}
         >
-          ▶
+          {live ? "⏸" : "▶"}
         </button>
         <button
           title={t("settings")}
@@ -263,7 +360,21 @@ function App() {
           ×
         </button>
       </nav>
-      <div className="translation-bar">{t("translationPlaceholder")}</div>
+
+      <div className="translation-bar">
+        {errorMsg && <span className="capture-error">{errorMsg}</span>}
+        {thumbnail && !errorMsg && (
+          <>
+            <img
+              src={`data:image/png;base64,${thumbnail}`}
+              alt="Capture thumbnail"
+              className="capture-thumbnail"
+            />
+            <span className="capture-info">{captureInfo}</span>
+          </>
+        )}
+        {!thumbnail && !errorMsg && <span>{t("translationPlaceholder")}</span>}
+      </div>
     </main>
   );
 }
