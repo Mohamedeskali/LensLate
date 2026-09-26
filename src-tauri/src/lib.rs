@@ -85,14 +85,6 @@ fn log_frontend_error(message: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_some()
-        && std::env::var_os("GDK_BACKEND").is_none()
-    {
-        // Prefer XWayland for the transparent frame when running under Wayland.
-        std::env::set_var("GDK_BACKEND", "x11");
-    }
     eprintln!(
         "[lenslate] GDK_BACKEND={}, WAYLAND_DISPLAY={}, DISPLAY={}",
         std::env::var("GDK_BACKEND").unwrap_or_else(|_| "<unset>".into()),
@@ -102,7 +94,13 @@ pub fn run() {
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyY);
     let shortcut_for_handler = shortcut;
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| toggle_frame(app)))
+        // Must stay first: a second instance forwards its argv over D-Bus and exits
+        // during plugin init, before any window is created.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+            eprintln!("[lenslate] toggle received (argv: {argv:?})");
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || toggle_frame(&handle));
+        }))
         .plugin(tauri_plugin_global_shortcut::Builder::new().with_handler(move |app, pressed, event| {
             if pressed == &shortcut_for_handler && event.state() == ShortcutState::Pressed { toggle_frame(app); }
         }).build())

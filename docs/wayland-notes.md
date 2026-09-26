@@ -1,33 +1,38 @@
 # Wayland notes
 
-## Session measured
-
-The development session used for Phase 1d reports:
-
-```text
-XDG_SESSION_TYPE=wayland
-WAYLAND_DISPLAY=wayland-0
-DISPLAY=:0
-GDK_BACKEND=x11
-```
-
-`xwininfo` is installed at `/usr/bin/xwininfo`. Because the frame was not
-running during the environment probe, there was no frame window ID to inspect
-with `xwininfo`; `DISPLAY=:0` confirms that an X11 display is available for
-XWayland inspection.
-
 ## Runtime choice
 
-On Linux, when both `WAYLAND_DISPLAY` and `DISPLAY` are present and
-`GDK_BACKEND` has not already been selected by the user, LensLate sets
-`GDK_BACKEND=x11` before Tauri creates its windows. This requests the XWayland
-backend for the transparent frame, while leaving an explicit user choice
-untouched.
+LensLate runs on native Wayland by default and no longer forces
+`GDK_BACKEND=x11`. Under XWayland, `start_dragging()` and
+`start_resize_dragging(direction)` did not move the frame and only some edges
+resized; on native Wayland both work. An explicit `GDK_BACKEND` set by the user
+is still honoured, and the value is printed at startup:
 
-The frame uses Tauri's native `start_dragging()` and
-`start_resize_dragging(direction)` APIs. The translation bar is part of the
-same `frame` webview window, so it follows the frame rather than relying on a
-second window.
+```text
+[lenslate] GDK_BACKEND=<unset>, WAYLAND_DISPLAY=wayland-0, DISPLAY=:0
+```
+
+The translation bar is part of the same `frame` webview window, so it follows
+the frame rather than relying on a second window.
+
+## Toggle shortcut
+
+Tauri's global-shortcut plugin cannot grab keys on GNOME Wayland, so the frame
+is toggled by a GNOME custom shortcut that runs `lenslate --toggle`. The
+single-instance plugin is registered first: a second process claims the
+`com.lenslate.app.SingleInstance` D-Bus name, finds it taken, forwards its argv
+to the running instance and exits during plugin init, before any window is
+created. The running instance logs `[lenslate] toggle received` and toggles the
+frame on the main thread.
+
+## Snap-packaged VS Code terminals
+
+The VS Code snap exports `GDK_BACKEND=x11`, `GTK_PATH`, `GIO_MODULE_DIR`,
+`GSETTINGS_SCHEMA_DIR` and a snap-prefixed `XDG_DATA_DIRS`. Apps started from
+its integrated terminal inherit them: they run on XWayland, and on native
+Wayland GTK aborts with `Settings schema
+'org.gnome.settings-daemon.plugins.xsettings' does not contain a key named
+'antialiasing'`. Run LensLate from GNOME Terminal, or clear those variables.
 
 ## Geometry
 
