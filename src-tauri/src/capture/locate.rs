@@ -1,4 +1,4 @@
-use crate::capture::{Rect, MARKER_BORDER_PX, MARKER_RGB, INSET_PX};
+use crate::capture::{Rect, INSET_PX, MARKER_BORDER_PX, MARKER_RGB};
 use image::{Rgba, RgbaImage};
 
 const COLOR_TOLERANCE: u8 = 12;
@@ -56,48 +56,70 @@ fn check_border_at(img: &RgbaImage, rect: Rect) -> bool {
     true
 }
 
-pub fn locate_frame(img: &RgbaImage, hint: Option<Rect>) -> Option<Rect> {
-    let img_w = img.width() as i32;
-    let img_h = img.height() as i32;
-    let min_dim = (MARKER_BORDER_PX * 2 + INSET_PX * 2) as i32;
+/// Number of consecutive marker pixels starting at (x, y) in direction (dx, dy).
+fn run_len(img: &RgbaImage, x: i32, y: i32, dx: i32, dy: i32) -> i32 {
+    let mut n = 0;
+    while is_marker_border(img, x + dx * n, y + dy * n) {
+        n += 1;
+    }
+    n
+}
 
-    let search_regions: Vec<Rect> = if let Some(h) = hint {
-        let hint_expanded = Rect {
-            x: (h.x - 50).max(0),
-            y: (h.y - 50).max(0),
-            w: (h.w + 100).min(img.width() - h.x as u32),
-            h: (h.h + 100).min(img.height() - h.y as u32),
-        };
-        vec![hint_expanded]
-    } else {
-        vec![Rect { x: 0, y: 0, w: img.width(), h: img.height() }]
-    };
+fn search_region(img: &RgbaImage, region: Rect, min_dim: i32) -> Option<Rect> {
+    let x_end = (region.x + region.w as i32).min(img.width() as i32);
+    let y_end = (region.y + region.h as i32).min(img.height() as i32);
 
-    for region in search_regions {
-        let region_x_end = (region.x + region.w as i32).min(img_w);
-        let region_y_end = (region.y + region.h as i32).min(img_h);
-
-        for y in region.y..region_y_end - min_dim + 1 {
-            for x in region.x..region_x_end - min_dim + 1 {
-                let max_w = (region_x_end - x).min(img_w - x);
-                let max_h = (region_y_end - y).min(img_h - y);
-
-                for w in min_dim..=max_w {
-                    if x + w > img_w { break; }
-                    for h in min_dim..=max_h {
-                        if y + h > img_h { break; }
-
-                        let rect = Rect { x, y, w: w as u32, h: h as u32 };
-                        if check_border_at(img, rect) {
-                            return Some(rect);
-                        }
-                    }
-                }
+    for y in region.y.max(0)..y_end {
+        for x in region.x.max(0)..x_end {
+            // Only a top-left corner can start a frame; its size follows from the edge runs.
+            if !is_marker_border(img, x, y)
+                || is_marker_border(img, x - 1, y)
+                || is_marker_border(img, x, y - 1)
+            {
+                continue;
+            }
+            let w = run_len(img, x, y, 1, 0);
+            let h = run_len(img, x, y, 0, 1);
+            if w < min_dim || h < min_dim {
+                continue;
+            }
+            let rect = Rect {
+                x,
+                y,
+                w: w as u32,
+                h: h as u32,
+            };
+            if check_border_at(img, rect) {
+                return Some(rect);
             }
         }
     }
 
     None
+}
+
+pub fn locate_frame(img: &RgbaImage, hint: Option<Rect>) -> Option<Rect> {
+    let min_dim = (MARKER_BORDER_PX * 2 + INSET_PX * 2) as i32;
+    let full = Rect {
+        x: 0,
+        y: 0,
+        w: img.width(),
+        h: img.height(),
+    };
+
+    // Try near the last known position first, then fall back to the whole image.
+    if let Some(h) = hint {
+        let near = Rect {
+            x: h.x - 50,
+            y: h.y - 50,
+            w: h.w + 100,
+            h: h.h + 100,
+        };
+        if let Some(rect) = search_region(img, near, min_dim) {
+            return Some(rect);
+        }
+    }
+    search_region(img, full, min_dim)
 }
 
 pub fn crop_inside(img: &RgbaImage, rect: Rect, inset: u32) -> RgbaImage {
@@ -146,7 +168,11 @@ mod tests {
         // Fill with noise
         for y in 0..height {
             for x in 0..width {
-                img.put_pixel(x, y, Rgba([(x * 7) as u8, (y * 11) as u8, ((x + y) * 13) as u8, 255]));
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgba([(x * 7) as u8, (y * 11) as u8, ((x + y) * 13) as u8, 255]),
+                );
             }
         }
 
@@ -211,9 +237,51 @@ mod tests {
     #[test]
     fn test_locate_frame_with_hint() {
         let img = create_test_image_with_frame(200, 150, 20, 20, 80, 60, 1);
-        let hint = Rect { x: 15, y: 15, w: 30, h: 30 };
+        let hint = Rect {
+            x: 15,
+            y: 15,
+            w: 30,
+            h: 30,
+        };
         let result = locate_frame(&img, Some(hint));
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_locate_frame_stale_hint_falls_back() {
+        let img = create_test_image_with_frame(400, 300, 250, 180, 100, 80, 1);
+        let hint = Rect {
+            x: 10,
+            y: 10,
+            w: 80,
+            h: 60,
+        };
+        assert_eq!(
+            locate_frame(&img, Some(hint)),
+            Some(Rect {
+                x: 250,
+                y: 180,
+                w: 100,
+                h: 80
+            })
+        );
+    }
+
+    #[test]
+    fn test_locate_frame_full_hd_is_fast() {
+        let img = create_test_image_with_frame(1920, 1080, 900, 700, 600, 200, 1);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            locate_frame(&img, None),
+            Some(Rect {
+                x: 900,
+                y: 700,
+                w: 600,
+                h: 200
+            })
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(locate_frame(&RgbaImage::new(1920, 1080), None), None);
     }
 
     #[test]
@@ -238,13 +306,21 @@ mod tests {
             img.put_pixel(x, 75, MARKER_RGB);
         }
         let result = locate_frame(&img, None);
-        assert!(result.is_none(), "Thin line should not be detected as frame");
+        assert!(
+            result.is_none(),
+            "Thin line should not be detected as frame"
+        );
     }
 
     #[test]
     fn test_crop_inside() {
         let img = create_test_image_with_frame(1920, 1080, 100, 100, 400, 300, 1);
-        let rect = Rect { x: 100, y: 100, w: 400, h: 300 };
+        let rect = Rect {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         let cropped = crop_inside(&img, rect, INSET_PX);
         assert_eq!(cropped.width(), 400 - (MARKER_BORDER_PX + INSET_PX) * 2);
         assert_eq!(cropped.height(), 300 - (MARKER_BORDER_PX + INSET_PX) * 2);
@@ -253,7 +329,12 @@ mod tests {
     #[test]
     fn test_crop_inside_scaled() {
         let img = create_test_image_with_frame(3840, 2160, 200, 200, 400, 300, 2);
-        let rect = Rect { x: 200, y: 200, w: 800, h: 600 };
+        let rect = Rect {
+            x: 200,
+            y: 200,
+            w: 800,
+            h: 600,
+        };
         let cropped = crop_inside(&img, rect, INSET_PX);
         assert_eq!(cropped.width(), 800 - (MARKER_BORDER_PX + INSET_PX) * 2);
         assert_eq!(cropped.height(), 600 - (MARKER_BORDER_PX + INSET_PX) * 2);
@@ -262,7 +343,12 @@ mod tests {
     #[test]
     fn test_frame_hash_consistent() {
         let img = create_test_image_with_frame(1920, 1080, 100, 100, 400, 300, 1);
-        let rect = Rect { x: 100, y: 100, w: 400, h: 300 };
+        let rect = Rect {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         let cropped = crop_inside(&img, rect, INSET_PX);
         let hash1 = frame_hash(&cropped);
         let hash2 = frame_hash(&cropped);
@@ -275,7 +361,12 @@ mod tests {
         let mut img2 = create_test_image_with_frame(1920, 1080, 100, 100, 400, 300, 1);
         // Modify one pixel INSIDE the cropped region (frame at 100,100, border=2, inset=3 -> cropped starts at 105,105)
         img2.put_pixel(110, 110, Rgba([255, 0, 0, 255]));
-        let rect = Rect { x: 100, y: 100, w: 400, h: 300 };
+        let rect = Rect {
+            x: 100,
+            y: 100,
+            w: 400,
+            h: 300,
+        };
         let cropped1 = crop_inside(&img1, rect, INSET_PX);
         let cropped2 = crop_inside(&img2, rect, INSET_PX);
         assert_ne!(frame_hash(&cropped1), frame_hash(&cropped2));

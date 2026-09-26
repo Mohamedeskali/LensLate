@@ -136,7 +136,7 @@ function App() {
         y?: number;
       }>("frame");
       const minWidth = 120;
-      const minHeight = 60;
+      const minHeight = 100;
       const maxWidth = monitor
         ? Math.max(minWidth, monitor.size.width * 0.8)
         : 480;
@@ -195,6 +195,7 @@ function App() {
 
     let unlistenFrame: (() => void) | null = null;
     let unlistenError: (() => void) | null = null;
+    let unlistenStopped: (() => void) | null = null;
 
     const setupListeners = async () => {
       unlistenFrame = await listen<CaptureEvent>(
@@ -219,6 +220,9 @@ function App() {
           }
         },
       );
+
+      // Backend stops live capture by itself when the frame is hidden.
+      unlistenStopped = await listen("capture://stopped", () => setLive(false));
     };
 
     setupListeners();
@@ -226,6 +230,7 @@ function App() {
     return () => {
       unlistenFrame?.();
       unlistenError?.();
+      unlistenStopped?.();
     };
   }, [view, t]);
 
@@ -324,7 +329,7 @@ function App() {
       />
       <div className="frame-outline" aria-hidden="true" />
 
-      {/* Toolbar moved OUTSIDE the capture area (above the top border) */}
+      {/* Toolbar sits outside the capture area (in the gutter above the border) */}
       <nav
         className={`toolbar${hovered ? " toolbar-visible" : ""}`}
         aria-label={t("toolbar")}

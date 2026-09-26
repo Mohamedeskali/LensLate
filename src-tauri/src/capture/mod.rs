@@ -45,6 +45,10 @@ pub trait ScreenCapture: Send {
     fn capture_monitor(&mut self) -> CaptureResult<RgbaImage>;
     fn start_stream(&mut self, fps: u32, tx: Sender<RgbaImage>) -> CaptureResult<()>;
     fn stop_stream(&mut self);
+    /// Release everything (stream, portal session) before the app quits.
+    fn shutdown(&mut self) {
+        self.stop_stream();
+    }
     fn is_wayland(&self) -> bool;
 }
 
@@ -61,7 +65,11 @@ pub fn frame_hash(img: &RgbaImage) -> u64 {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-#[serde(tag = "type")]
+#[serde(
+    tag = "type",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase"
+)]
 pub enum CaptureEvent {
     Frame {
         thumbnail_png_base64: String,
