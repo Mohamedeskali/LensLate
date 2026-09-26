@@ -24,3 +24,13 @@ src-tauri/gen
 *.njsproj
 *.sln
 *.sw?
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Tool caches
+.eslintcache
+*.tsbuildinfo
+.vite
