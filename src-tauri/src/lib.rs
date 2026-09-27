@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 mod capture;
+pub mod ocr;
 
 use capture::wayland::WaylandCapture;
 use capture::xcap_backend::XCapCapture;
@@ -268,6 +269,8 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
         let mut skipped = 0u64;
         let mut last_emit = Instant::now();
         let mut last_rect: Option<Rect> = None;
+        let mut consecutive_missing = 0u32;
+        const MAX_MISSING_REUSE: u32 = 3;
 
         while LIVE_CAPTURE_RUNNING.load(Ordering::SeqCst) {
             if !is_frame_visible(&app_handle) {
@@ -292,13 +295,14 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
 
             match rect {
                 Some(r) => {
+                    consecutive_missing = 0;
                     last_rect = Some(r);
                     let cropped = crop_inside(&full_frame, r, INSET_PX);
-                    let hash = frame_hash(&cropped);
+                    let _hash = frame_hash(&cropped);
 
                     let should_emit = {
                         let mut state = state_arc_clone.lock().unwrap();
-                        if state.last_cropped.as_ref().map(frame_hash) == Some(hash) {
+                        if state.last_cropped.as_ref().map(frame_hash) == Some(_hash) {
                             skipped += 1;
                             false
                         } else {
@@ -308,7 +312,7 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                         }
                     };
 
-                    if should_emit {
+                    if should_emit && last_emit.elapsed() >= Duration::from_secs(1) {
                         let thumbnail = create_thumbnail(&cropped);
                         let ms = start.elapsed().as_millis() as u64;
 
@@ -329,15 +333,48 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                         );
                         skipped = 0;
                         last_emit = Instant::now();
+                    } else if should_emit {
+                        skipped += 1;
                     }
                 }
                 None => {
+                    consecutive_missing += 1;
                     skipped += 1;
-                    if last_emit.elapsed() > Duration::from_secs(1) {
+
+                    if consecutive_missing <= MAX_MISSING_REUSE {
+                        if let Some(r) = last_rect {
+                            let cropped = crop_inside(&full_frame, r, INSET_PX);
+                            let _hash = frame_hash(&cropped);
+
+                            if last_emit.elapsed() >= Duration::from_secs(1) {
+                                let thumbnail = create_thumbnail(&cropped);
+                                let ms = start.elapsed().as_millis() as u64;
+
+                                eprintln!(
+                                    "[lenslate] capture reuse rect={},{},{}x{} ms={} skipped={} missing={}/{}",
+                                    r.x, r.y, r.w, r.h, ms, skipped, consecutive_missing, MAX_MISSING_REUSE
+                                );
+
+                                let _ = app_handle.emit(
+                                    "capture://frame",
+                                    CaptureEvent::Frame {
+                                        thumbnail_png_base64: thumbnail,
+                                        width: cropped.width(),
+                                        height: cropped.height(),
+                                        ms,
+                                        skipped,
+                                    },
+                                );
+                                skipped = 0;
+                                last_emit = Instant::now();
+                            }
+                        }
+                    } else if last_emit.elapsed() > Duration::from_secs(1) {
                         eprintln!(
-                            "[lenslate] capture found=no rect=none ms={} skipped={}",
+                            "[lenslate] capture found=no rect=none ms={} skipped={} consecutive_missing={}",
                             start.elapsed().as_millis(),
-                            skipped
+                            skipped,
+                            consecutive_missing
                         );
                         let _ = app_handle.emit(
                             "capture://error",

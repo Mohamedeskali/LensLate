@@ -1,0 +1,2 @@
+Order #12345 - Total: $99.99
+Thank you for your purchase!

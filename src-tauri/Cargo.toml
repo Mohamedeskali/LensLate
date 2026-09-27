@@ -36,8 +36,29 @@ base64 = "0.22"
 png = "0.18"
 chrono = { version = "0.4", features = ["serde"] }
 
+# OCR (Phase 3a)
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "tls-rustls",
+] }
+ndarray = "0.17"
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[[example]]
+name = "ocr_file"
+path = "examples/ocr_file.rs"
+
 [profile.release]
 codegen-units = 1
 lto = true

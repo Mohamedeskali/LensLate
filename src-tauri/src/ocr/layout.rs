@@ -1,6 +1,4 @@
 use crate::ocr::{OcrLine, Rect, Script};
-use image::RgbaImage;
-use std::collections::HashMap;
 
 /// Group detection boxes into lines based on vertical overlap
 pub fn group_boxes_into_lines(boxes: &[Rect], y_tolerance: f32) -> Vec<Vec<Rect>> {
@@ -9,7 +7,7 @@ pub fn group_boxes_into_lines(boxes: &[Rect], y_tolerance: f32) -> Vec<Vec<Rect>
     }
 
     // Sort boxes by vertical center
-    let mut sorted: Vec<_> = boxes.iter().copied().collect();
+    let mut sorted: Vec<_> = boxes.to_vec();
     sorted.sort_by_key(|b| b.y + (b.h as i32 / 2));
 
     let mut lines = Vec::new();
@@ -58,12 +56,14 @@ pub fn detect_script_from_line(line_boxes: &[Rect], img_width: u32) -> Script {
     }
 
     // Calculate average box width relative to image width
-    let avg_width: f32 = line_boxes.iter().map(|b| b.w as f32).sum::<f32>() / line_boxes.len() as f32;
+    let avg_width: f32 =
+        line_boxes.iter().map(|b| b.w as f32).sum::<f32>() / line_boxes.len() as f32;
     let relative_width = avg_width / img_width as f32;
 
     // Arabic characters are typically narrower relative to line width
     // Also check aspect ratio - Arabic tends to have taller, narrower characters
-    let avg_height: f32 = line_boxes.iter().map(|b| b.h as f32).sum::<f32>() / line_boxes.len() as f32;
+    let avg_height: f32 =
+        line_boxes.iter().map(|b| b.h as f32).sum::<f32>() / line_boxes.len() as f32;
     let aspect_ratio = avg_width / avg_height.max(1.0);
 
     // Heuristic: if aspect ratio is low (tall/narrow chars) or relative width is small
@@ -77,13 +77,10 @@ pub fn detect_script_from_line(line_boxes: &[Rect], img_width: u32) -> Script {
 /// Merge OCR lines into paragraphs with proper reading order
 /// For Arabic: right-to-left within line, top-to-bottom for lines
 /// For Latin: left-to-right within line, top-to-bottom for lines
-pub fn merge_lines_to_text(
-    lines: &[Vec<OcrLine>],
-    script: Script,
-) -> String {
+pub fn merge_lines_to_text(lines: &[Vec<OcrLine>], script: Script) -> String {
     let mut result = String::new();
 
-    for (line_idx, line) in lines.iter().enumerate() {
+    for line in lines.iter() {
         if line.is_empty() {
             continue;
         }
@@ -235,9 +232,24 @@ mod tests {
     #[test]
     fn test_group_boxes_into_lines() {
         let boxes = vec![
-            Rect { x: 10, y: 10, w: 50, h: 20 },
-            Rect { x: 70, y: 12, w: 50, h: 20 }, // Same line (y diff = 2)
-            Rect { x: 10, y: 50, w: 50, h: 20 }, // Next line (y diff = 40)
+            Rect {
+                x: 10,
+                y: 10,
+                w: 50,
+                h: 20,
+            },
+            Rect {
+                x: 70,
+                y: 12,
+                w: 50,
+                h: 20,
+            }, // Same line (y diff = 2)
+            Rect {
+                x: 10,
+                y: 50,
+                w: 50,
+                h: 20,
+            }, // Next line (y diff = 40)
         ];
 
         let lines = group_boxes_into_lines(&boxes, 0.5);
@@ -249,8 +261,18 @@ mod tests {
     #[test]
     fn test_sort_lines_reading_order() {
         let mut lines = vec![
-            vec![Rect { x: 10, y: 50, w: 50, h: 20 }],
-            vec![Rect { x: 10, y: 10, w: 50, h: 20 }],
+            vec![Rect {
+                x: 10,
+                y: 50,
+                w: 50,
+                h: 20,
+            }],
+            vec![Rect {
+                x: 10,
+                y: 10,
+                w: 50,
+                h: 20,
+            }],
         ];
 
         sort_lines_reading_order(&mut lines);
@@ -262,12 +284,40 @@ mod tests {
     fn test_merge_lines_to_text_latin() {
         let lines = vec![
             vec![
-                OcrLine { text: "Hello".into(), conf: 0.9, rect: Rect { x: 10, y: 10, w: 50, h: 20 }, rtl: false },
-                OcrLine { text: "World".into(), conf: 0.9, rect: Rect { x: 70, y: 10, w: 50, h: 20 }, rtl: false },
+                OcrLine {
+                    text: "Hello".into(),
+                    conf: 0.9,
+                    rect: Rect {
+                        x: 10,
+                        y: 10,
+                        w: 50,
+                        h: 20,
+                    },
+                    rtl: false,
+                },
+                OcrLine {
+                    text: "World".into(),
+                    conf: 0.9,
+                    rect: Rect {
+                        x: 70,
+                        y: 10,
+                        w: 50,
+                        h: 20,
+                    },
+                    rtl: false,
+                },
             ],
-            vec![
-                OcrLine { text: "Test".into(), conf: 0.9, rect: Rect { x: 10, y: 40, w: 40, h: 20 }, rtl: false },
-            ],
+            vec![OcrLine {
+                text: "Test".into(),
+                conf: 0.9,
+                rect: Rect {
+                    x: 10,
+                    y: 40,
+                    w: 40,
+                    h: 20,
+                },
+                rtl: false,
+            }],
         ];
 
         let text = merge_lines_to_text(&lines, Script::Latin);
@@ -276,16 +326,34 @@ mod tests {
 
     #[test]
     fn test_merge_lines_to_text_arabic() {
-        let lines = vec![
-            vec![
-                OcrLine { text: "مرحبا".into(), conf: 0.9, rect: Rect { x: 70, y: 10, w: 50, h: 20 }, rtl: true },
-                OcrLine { text: "العالم".into(), conf: 0.9, rect: Rect { x: 10, y: 10, w: 50, h: 20 }, rtl: true },
-            ],
-        ];
+        let lines = vec![vec![
+            OcrLine {
+                text: "مرحبا".into(),
+                conf: 0.9,
+                rect: Rect {
+                    x: 70,
+                    y: 10,
+                    w: 50,
+                    h: 20,
+                },
+                rtl: true,
+            },
+            OcrLine {
+                text: "العالم".into(),
+                conf: 0.9,
+                rect: Rect {
+                    x: 10,
+                    y: 10,
+                    w: 50,
+                    h: 20,
+                },
+                rtl: true,
+            },
+        ]];
 
         let text = merge_lines_to_text(&lines, Script::Arabic);
-        // Should be right-to-left: "العالم مرحبا"
-        assert_eq!(text, "العالممرحبا");
+        // Should be right-to-left: "مرحبا" (x=70, rightmost) then "العالم" (x=10, leftmost)
+        assert_eq!(text, "مرحباالعالم");
     }
 
     #[test]

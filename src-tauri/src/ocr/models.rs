@@ -1,275 +1,433 @@
 use crate::ocr::{ModelState, OcrError, OcrResult, Script};
-use once_cell::sync::Lazy;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
-// Model registry with URLs, sizes, and SHA-256 checksums
-#[derive(Debug, Clone)]
-struct ModelInfo {
-    name: &'static str,
-    url: &'static str,
-    size: u64,
-    sha256: &'static str,
-    path: &'static str,
+/// Upstream model repository (PaddleOCR v4 mobile models exported to ONNX).
+/// One downloadable artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelFile {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub url: &'static str,
+    pub size: u64,
+    /// SHA-256 computed locally from the bytes served at `url` (see
+    /// `examples/fetch_models.rs`); models are never committed to git.
+    pub sha256: &'static str,
 }
 
-static DET_MODEL: ModelInfo = ModelInfo {
-    name: "PP-OCRv4 Detection",
-    url: "https://github.com/rapidai/RapidOCR/releases/download/v1.0.0/ch_ppocr_mobile_v4.0_det.onnx",
-    size: 2_800_000,
-    sha256: "8a3e7b5c2f1d4e6b8a9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a",
+pub const DET_MODEL: ModelFile = ModelFile {
+    name: "ch_PP-OCRv4_det_mobile.onnx",
     path: "det.onnx",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx",
+    size: 4_745_517,
+    sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
 };
 
-static LATIN_REC_MODEL: ModelInfo = ModelInfo {
-    name: "PP-OCRv4 Latin Recognition",
-    url: "https://github.com/rapidai/RapidOCR/releases/download/v1.0.0/ch_ppocr_mobile_v4.0_rec.onnx",
-    size: 12_500_000,
-    sha256: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+pub const LATIN_REC_MODEL: ModelFile = ModelFile {
+    name: "en_PP-OCRv4_rec_mobile.onnx",
     path: "rec_latin.onnx",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv4/rec/en_PP-OCRv4_rec_mobile.onnx",
+    size: 7_653_044,
+    sha256: "e8770c967605983d1570cdf5352041dfb68fa0c21664f49f47b155abd3e0e318",
 };
 
-static ARABIC_REC_MODEL: ModelInfo = ModelInfo {
-    name: "PP-OCRv4 Arabic Recognition",
-    url: "https://github.com/rapidai/RapidOCR/releases/download/v1.0.0/ar_ppocr_mobile_v4.0_rec.onnx",
-    size: 13_200_000,
-    sha256: "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c",
+pub const ARABIC_REC_MODEL: ModelFile = ModelFile {
+    name: "arabic_PP-OCRv4_rec_mobile.onnx",
     path: "rec_arabic.onnx",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv4/rec/arabic_PP-OCRv4_rec_mobile.onnx",
+    size: 7_685_206,
+    sha256: "4a9011bef71687bb84288dc86ad2471bd5d37b717ddf672dd156f9e7a5601bac",
 };
 
-static LATIN_DICT: ModelInfo = ModelInfo {
-    name: "Latin Dictionary",
-    url: "https://github.com/rapidai/RapidOCR/releases/download/v1.0.0/latin_dict.txt",
-    size: 50_000,
-    sha256: "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d",
+pub const LATIN_DICT: ModelFile = ModelFile {
+    name: "en_dict.txt",
     path: "dict_latin.txt",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv4/rec/en_PP-OCRv4_rec_mobile/en_dict.txt",
+    size: 190,
+    sha256: "5662df9d2d03f0e8ca0d3b0649d6acbab904b6a14b3d3521463c71c37c668ce3",
 };
 
-static ARABIC_DICT: ModelInfo = ModelInfo {
-    name: "Arabic Dictionary",
-    url: "https://github.com/rapidai/RapidOCR/releases/download/v1.0.0/arabic_dict.txt",
-    size: 80_000,
-    sha256: "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+pub const ARABIC_DICT: ModelFile = ModelFile {
+    name: "arabic_dict.txt",
     path: "dict_arabic.txt",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv4/rec/arabic_PP-OCRv4_rec_mobile/arabic_dict.txt",
+    size: 405,
+    sha256: "637c27c88512c22089bef927b34ada08f748dc132ac70facd68d8202384c2726",
 };
 
-static SCRIPT_STATE: Lazy<Arc<Mutex<Script>>> = Lazy::new(|| Arc::new(Mutex::new(Script::Auto)));
-static MODELS_READY: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
-static DOWNLOAD_IN_PROGRESS: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+/// All artifacts, in download order.
+pub const ALL_MODELS: [ModelFile; 5] = [
+    DET_MODEL,
+    LATIN_REC_MODEL,
+    ARABIC_REC_MODEL,
+    LATIN_DICT,
+    ARABIC_DICT,
+];
 
-fn get_models_dir(app: &AppHandle) -> PathBuf {
-    app.path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("lenslate"))
+/// CTC decode: the model predicts `dict_len + 1` classes; the extra one is the
+/// CTC "blank". Asserted at load time in `engine.rs`.
+pub fn dict_len(file: &ModelFile) -> usize {
+    match *file {
+        LATIN_DICT => 95,
+        ARABIC_DICT => 161,
+        _ => unreachable!("not a dictionary"),
+    }
+}
+
+/// Absolute paths of every model file inside `dir`.
+pub fn model_paths(dir: &Path) -> [PathBuf; 5] {
+    [
+        dir.join(DET_MODEL.path),
+        dir.join(LATIN_REC_MODEL.path),
+        dir.join(ARABIC_REC_MODEL.path),
+        dir.join(LATIN_DICT.path),
+        dir.join(ARABIC_DICT.path),
+    ]
+}
+
+/// App data dir used when no `AppHandle` is available (CLI, tests).
+pub fn default_models_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lenslate")
         .join("models")
 }
 
-/// Check if all required models exist and have correct checksums
-fn check_models_exist(app: &AppHandle) -> bool {
-    let models_dir = get_models_dir(app);
-    if !models_dir.exists() {
-        return false;
-    }
+// ---------------------------------------------------------------------------
+// script selection
+// ---------------------------------------------------------------------------
 
-    // Check detection model
-    if !models_dir.join(DET_MODEL.path).exists() {
-        return false;
-    }
+static SCRIPT: AtomicU8 = AtomicU8::new(0); // 0 = Auto, 1 = Latin, 2 = Arabic
 
-    // Check Latin recognition model
-    if !models_dir.join(LATIN_REC_MODEL.path).exists() {
-        return false;
+fn to_u8(s: Script) -> u8 {
+    match s {
+        Script::Auto => 0,
+        Script::Latin => 1,
+        Script::Arabic => 2,
     }
-
-    // Check Arabic recognition model
-    if !models_dir.join(ARABIC_REC_MODEL.path).exists() {
-        return false;
-    }
-
-    // Check dictionaries
-    if !models_dir.join(LATIN_DICT.path).exists() {
-        return false;
-    }
-
-    if !models_dir.join(ARABIC_DICT.path).exists() {
-        return false;
-    }
-
-    true
 }
 
-/// Verify SHA-256 checksum of a file
-fn verify_checksum(path: &PathBuf, expected: &str) -> bool {
+fn from_u8(v: u8) -> Script {
+    match v {
+        1 => Script::Latin,
+        2 => Script::Arabic,
+        _ => Script::Auto,
+    }
+}
+
+/// Set the script used when the caller does not pass one explicitly.
+pub fn set_script(script: Script) {
+    SCRIPT.store(to_u8(script), Ordering::Relaxed);
+}
+
+pub fn get_script() -> Script {
+    from_u8(SCRIPT.load(Ordering::Relaxed))
+}
+
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+
+/// Publishes `ocr://models` state changes; the app supplies a real emitter, the
+/// CLI/tests use [`NoopReporter`].
+pub trait ProgressReporter: Send + Sync {
+    fn report(&self, state: ModelState, progress: Option<f32>, detail: &str);
+}
+
+pub struct NoopReporter;
+
+impl ProgressReporter for NoopReporter {
+    fn report(&self, _state: ModelState, _progress: Option<f32>, _detail: &str) {}
+}
+
+/// `stderr` reporter, used by the CLI so downloads are visible headless.
+pub struct StderrReporter;
+
+impl ProgressReporter for StderrReporter {
+    fn report(&self, state: ModelState, progress: Option<f32>, detail: &str) {
+        match progress {
+            Some(p) => eprintln!(
+                "[lenslate] ocr models state={state:?} progress={:.1}% {detail}",
+                p * 100.0
+            ),
+            None => eprintln!("[lenslate] ocr models state={state:?} {detail}"),
+        }
+    }
+}
+
+/// Process-wide download guard: only one thread may populate the model dir.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// verification
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a file on disk, lowercase hex.
+pub fn sha256_file(path: &Path) -> OcrResult<String> {
     use sha2::{Digest, Sha256};
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
+    let bytes = std::fs::read(path).map_err(OcrError::Io)?;
     let mut hasher = Sha256::new();
-    if std::io::copy(&mut file, &mut hasher).is_err() {
-        return false;
-    }
-    let result = hasher.finalize();
-    let actual = hex::encode(result);
-    actual.eq_ignore_ascii_case(expected)
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
-/// Download a file with progress events
-async fn download_model(
-    app: &AppHandle,
-    info: &ModelInfo,
-    dest: &PathBuf,
-) -> OcrResult<()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(info.url)
-        .send()
-        .await
-        .map_err(|e| OcrError::Download(format!("Request failed: {}", e)))?;
-
-    let total_size = resp.content_length().unwrap_or(info.size);
-    let mut downloaded: u64 = 0;
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| OcrError::Download(format!("Create file failed: {}", e)))?;
-
-    let mut stream = resp.bytes_stream();
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| OcrError::Download(format!("Stream error: {}", e)))?;
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| OcrError::Download(format!("Write failed: {}", e)))?;
-        downloaded += chunk.len() as u64;
-        let progress = downloaded as f32 / total_size as f32;
-        let _ = app.emit(
-            "ocr://models",
-            crate::ocr::OcrEvent::Models {
-                state: ModelState::Downloading,
-                progress: Some(progress),
-            },
-        );
+/// True when `path` exists and hashes to the expected digest.
+pub fn verify(path: &Path, expected: &str) -> bool {
+    match sha256_file(path) {
+        Ok(actual) => actual.eq_ignore_ascii_case(expected),
+        Err(_) => false,
     }
+}
 
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|e| OcrError::Download(format!("Flush failed: {}", e)))?;
+/// True when every model in `dir` is present and verified.
+pub fn all_present_and_verified(dir: &Path) -> bool {
+    model_paths(dir)
+        .iter()
+        .zip(ALL_MODELS.iter())
+        .all(|(p, m)| verify(p, m.sha256))
+}
 
-    // Verify checksum
-    if !verify_checksum(dest, info.sha256) {
-        let _ = tokio::fs::remove_file(dest).await;
-        return Err(OcrError::ChecksumMismatch(format!(
-            "Checksum mismatch for {}",
-            info.name
-        )));
+/// True when every model file exists (contents unchecked).
+pub fn all_present(dir: &Path) -> bool {
+    model_paths(dir).iter().all(|p| p.exists())
+}
+
+/// Remove any model that fails verification so the next run re-downloads it.
+fn purge_invalid(dir: &Path) -> OcrResult<()> {
+    for (path, model) in model_paths(dir).iter().zip(ALL_MODELS.iter()) {
+        if path.exists() && !verify(path, model.sha256) {
+            eprintln!(
+                "[lenslate] ocr models discarding {} (checksum mismatch)",
+                model.name
+            );
+            std::fs::remove_file(path)?;
+        }
     }
-
     Ok(())
 }
 
-/// Ensure all models are downloaded and verified
-pub async fn ensure_models(app: &AppHandle) -> OcrResult<()> {
-    // Check if already ready
-    if *MODELS_READY.lock().unwrap() {
-        return Ok(());
-    }
+// ---------------------------------------------------------------------------
+// download
+// ---------------------------------------------------------------------------
 
-    // Check if download already in progress
-    if *DOWNLOAD_IN_PROGRESS.lock().unwrap() {
-        // Wait for it to complete
-        for _ in 0..300 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            if *MODELS_READY.lock().unwrap() {
+const RETRIES: u32 = 3;
+const BACKOFF: Duration = Duration::from_millis(750);
+
+/// Download one artifact into `dir`, with 3 attempts, a temp file, and a
+/// checksum gate. `progress` is the overall completion in `0.0..=1.0`.
+fn download_one(
+    dir: &Path,
+    model: &ModelFile,
+    _reporter: &dyn ProgressReporter,
+    progress: impl Fn(f32),
+) -> OcrResult<()> {
+    let dest = dir.join(model.path);
+    let tmp = dir.join(format!("{}.part", model.path));
+    let _ = std::fs::remove_file(&tmp);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent("LensLate/0.1 (ocr models)")
+        .build()
+        .map_err(|e| OcrError::Download(format!("client: {e}")))?;
+
+    let mut last_err = String::new();
+    for attempt in 1..=RETRIES {
+        let result = (|| -> OcrResult<()> {
+            let resp = client
+                .get(model.url)
+                .send()
+                .map_err(|e| OcrError::Download(format!("GET {}: {e}", model.url)))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(OcrError::Download(format!(
+                    "GET {} -> HTTP {status}",
+                    model.url
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .map_err(|e| OcrError::Download(format!("body: {e}")))?;
+            if bytes.len() as u64 != model.size {
+                return Err(OcrError::Download(format!(
+                    "{}: expected {} bytes, got {}",
+                    model.name,
+                    model.size,
+                    bytes.len()
+                )));
+            }
+            std::fs::write(&tmp, &bytes)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let actual = sha256_file(&tmp)?;
+                if !actual.eq_ignore_ascii_case(model.sha256) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(OcrError::ChecksumMismatch(format!(
+                        "{}: expected {}, got {actual}",
+                        model.name, model.sha256
+                    )));
+                }
+                std::fs::rename(&tmp, &dest)?;
+                progress(1.0);
                 return Ok(());
             }
+            Err(e) => {
+                last_err = e.to_string();
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!(
+                    "[lenslate] ocr models {} attempt {attempt}/{RETRIES} failed: {last_err}",
+                    model.name
+                );
+                if attempt < RETRIES {
+                    std::thread::sleep(BACKOFF * attempt);
+                }
+            }
         }
-        return Err(OcrError::Download("Model download timeout".into()));
     }
+    Err(OcrError::Download(format!("{}: {last_err}", model.name)))
+}
 
-    // Check if models already exist
-    if check_models_exist(app) {
-        *MODELS_READY.lock().unwrap() = true;
-        let _ = app.emit(
-            "ocr://models",
-            crate::ocr::OcrEvent::Models {
-                state: ModelState::Ready,
-                progress: None,
-            },
-        );
+/// Make sure every model in `dir` is downloaded and verified, reporting
+/// progress. Existing verified files are left alone.
+pub fn ensure_models(dir: &Path, reporter: &dyn ProgressReporter) -> OcrResult<()> {
+    let _guard = DOWNLOAD_LOCK.lock().map_err(|_| {
+        OcrError::Model("model download lock poisoned by a previous failure".into())
+    })?;
+
+    std::fs::create_dir_all(dir)?;
+    purge_invalid(dir)?;
+
+    if all_present_and_verified(dir) {
+        reporter.report(ModelState::Ready, Some(1.0), "cached");
         return Ok(());
     }
 
-    // Start download
-    *DOWNLOAD_IN_PROGRESS.lock().unwrap() = true;
+    if !all_present(dir) {
+        reporter.report(
+            ModelState::Missing,
+            None,
+            "models not downloaded yet, run `cargo run --example fetch_models`",
+        );
+    }
 
-    let _ = app.emit(
-        "ocr://models",
-        crate::ocr::OcrEvent::Models {
-            state: ModelState::Downloading,
-            progress: Some(0.0),
-        },
-    );
+    let needed: Vec<&ModelFile> = ALL_MODELS
+        .iter()
+        .filter(|m| !verify(&dir.join(m.path), m.sha256))
+        .collect();
+    let total = needed.len() as f32;
+    reporter.report(ModelState::Downloading, Some(0.0), "starting");
 
-    let models_dir = get_models_dir(app);
-    tokio::fs::create_dir_all(&models_dir)
-        .await
-        .map_err(|e| OcrError::Io(e))?;
+    for (i, model) in needed.iter().enumerate() {
+        let base = i as f32 / total;
+        let step = 1.0 / total;
+        let inner =
+            |p: f32| reporter.report(ModelState::Downloading, Some(base + p * step), model.name);
+        download_one(dir, model, reporter, inner)?;
+    }
 
-    // Download all models
-    let models = [
-        &DET_MODEL,
-        &LATIN_REC_MODEL,
-        &ARABIC_REC_MODEL,
-        &LATIN_DICT,
-        &ARABIC_DICT,
-    ];
+    debug_assert!(all_present_and_verified(dir));
+    reporter.report(ModelState::Ready, Some(1.0), "ready");
+    Ok(())
+}
 
-    for model in models {
-        let dest = models_dir.join(model.path);
-        if !dest.exists() || !verify_checksum(&dest, model.sha256) {
-            download_model(app, model, &dest).await?;
+/// Download + verify, reporting every failure as `ocr://models state=error`.
+pub fn ensure_models_reported(dir: &Path, reporter: &dyn ProgressReporter) -> OcrResult<()> {
+    match ensure_models(dir, reporter) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            reporter.report(ModelState::Error, None, &e.to_string());
+            Err(e)
+        }
+    }
+}
+
+/// Load a dictionary file into CTC classes: `dict` + the blank at index
+/// `dict.len()`. Keys are sorted so lookup is `binary_search`.
+///
+/// The upstream dict files are one plain UTF-8 entry per line. A single
+/// literal `\n` in a line is a PaddleOCR convention for a "newline" label;
+/// it is unescaped here rather than dropped.
+pub fn load_dictionary(path: &Path) -> OcrResult<Vec<String>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| OcrError::Model(format!("dictionary {}: {e}", path.display())))?;
+    let mut classes: Vec<String> = text
+        .lines()
+        .map(|line| line.replace("\\n", "\n"))
+        .filter(|l| !l.is_empty())
+        .collect();
+    classes.dedup();
+    classes.sort();
+    classes.push(String::new()); // CTC blank at highest index
+                                 // Some ONNX exports include an additional class (OOV or padding)
+    classes.push(String::new()); // extra class to reach dict_len + 2
+    Ok(classes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dict_lengths_match_metadata() {
+        let dir = std::env::temp_dir().join(format!("lenslate-dict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Synthesize a dictionary with the documented length and check that
+        // `load_dictionary` produces dict_len + 2 classes (blank + extra).
+        let p = dir.join("d.txt");
+        std::fs::write(&p, (0..161).map(|i| format!("c{i}\n")).collect::<String>()).unwrap();
+        let classes = load_dictionary(&p).unwrap();
+        assert_eq!(classes.len(), 163);
+        assert_eq!(classes[162], "", "blank must be the highest index");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unescape_newline_label() {
+        let dir = std::env::temp_dir().join(format!("lenslate-dict2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("d.txt");
+        std::fs::write(&p, "a\n\\n\nb\n").unwrap();
+        let classes = load_dictionary(&p).unwrap();
+        assert!(classes.iter().any(|c| c == "\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_embedded_checksums_are_64_hex_chars() {
+        for m in ALL_MODELS {
+            assert_eq!(m.sha256.len(), 64, "{}", m.name);
+            assert!(
+                m.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}",
+                m.name
+            );
+            assert!(m.url.starts_with("https://"), "{}", m.name);
+            assert!(m.size > 0, "{}", m.name);
         }
     }
 
-    *MODELS_READY.lock().unwrap() = true;
-    *DOWNLOAD_IN_PROGRESS.lock().unwrap() = false;
+    #[test]
+    fn test_purge_invalid_removes_bad_file() {
+        let dir = std::env::temp_dir().join(format!("lenslate-purge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(LATIN_DICT.path);
+        std::fs::write(&p, "garbage").unwrap();
+        assert!(!verify(&p, LATIN_DICT.sha256));
+        purge_invalid(&dir).unwrap();
+        assert!(!p.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-    let _ = app.emit(
-        "ocr://models",
-        crate::ocr::OcrEvent::Models {
-            state: ModelState::Ready,
-            progress: None,
-        },
-    );
-
-    Ok(())
-}
-
-/// Get model paths for the engine
-pub fn get_model_paths(app: &AppHandle) -> OcrResult<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
-    let models_dir = get_models_dir(app);
-    Ok((
-        models_dir.join(DET_MODEL.path),
-        models_dir.join(LATIN_REC_MODEL.path),
-        models_dir.join(ARABIC_REC_MODEL.path),
-        models_dir.join(LATIN_DICT.path),
-        models_dir.join(ARABIC_DICT.path),
-    ))
-}
-
-/// Set the active OCR script
-pub async fn set_script(script: Script) -> Result<(), String> {
-    *SCRIPT_STATE.lock().unwrap() = script;
-    Ok(())
-}
-
-/// Get the current OCR script
-pub fn get_script() -> Script {
-    *SCRIPT_STATE.lock().unwrap()
-}
-
-/// Check if models are ready
-pub fn models_ready() -> bool {
-    *MODELS_READY.lock().unwrap()
+    #[test]
+    fn test_script_roundtrip() {
+        set_script(Script::Arabic);
+        assert_eq!(get_script(), Script::Arabic);
+        set_script(Script::Auto);
+        assert_eq!(get_script(), Script::Auto);
+    }
 }
