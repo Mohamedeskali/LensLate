@@ -13,6 +13,7 @@ mod capture;
 pub mod ocr;
 mod ocr_service;
 
+#[cfg(target_os = "linux")]
 use capture::wayland::WaylandCapture;
 use capture::xcap_backend::XCapCapture;
 use capture::{
@@ -103,18 +104,19 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn is_wayland_session() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
 }
 
 fn create_capture_backend(window_label: String, app: &AppHandle) -> Box<dyn ScreenCapture> {
+    #[cfg(target_os = "linux")]
     if is_wayland_session() {
-        Box::new(WaylandCapture::new())
-    } else {
-        let mut backend = XCapCapture::new(window_label);
-        backend.set_app_handle(app.clone());
-        Box::new(backend)
+        return Box::new(WaylandCapture::new());
     }
+    let mut backend = XCapCapture::new(window_label);
+    backend.set_app_handle(app.clone());
+    Box::new(backend)
 }
 
 struct CaptureState {

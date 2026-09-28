@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Upstream model repository (PaddleOCR v4 mobile models exported to ONNX).
+/// Upstream model repository (PaddleOCR mobile models exported to ONNX by
+/// RapidOCR).
 /// One downloadable artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelFile {
@@ -25,12 +26,14 @@ pub const DET_MODEL: ModelFile = ModelFile {
     sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9",
 };
 
+/// PaddleOCR's multilingual Latin model (French, Spanish, German, Italian,
+/// Portuguese, ... with accents). `en_PP-OCRv4` only knows printable ASCII.
 pub const LATIN_REC_MODEL: ModelFile = ModelFile {
-    name: "en_PP-OCRv4_rec_mobile.onnx",
+    name: "latin_PP-OCRv5_rec_mobile.onnx",
     path: "rec_latin.onnx",
-    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv4/rec/en_PP-OCRv4_rec_mobile.onnx",
-    size: 7_653_044,
-    sha256: "e8770c967605983d1570cdf5352041dfb68fa0c21664f49f47b155abd3e0e318",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/onnx/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile.onnx",
+    size: 7_904_513,
+    sha256: "b20bd37c168a570f583afbc8cd7925603890efbcdc000a59e22c269d160b5f5a",
 };
 
 pub const ARABIC_REC_MODEL: ModelFile = ModelFile {
@@ -42,11 +45,11 @@ pub const ARABIC_REC_MODEL: ModelFile = ModelFile {
 };
 
 pub const LATIN_DICT: ModelFile = ModelFile {
-    name: "en_dict.txt",
+    name: "ppocrv5_latin_dict.txt",
     path: "dict_latin.txt",
-    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv4/rec/en_PP-OCRv4_rec_mobile/en_dict.txt",
-    size: 190,
-    sha256: "5662df9d2d03f0e8ca0d3b0649d6acbab904b6a14b3d3521463c71c37c668ce3",
+    url: "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/master/paddle/PP-OCRv5/rec/latin_PP-OCRv5_rec_mobile/ppocrv5_latin_dict.txt",
+    size: 1_634,
+    sha256: "3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff",
 };
 
 pub const ARABIC_DICT: ModelFile = ModelFile {
@@ -71,7 +74,7 @@ pub const ALL_MODELS: [ModelFile; 5] = [
 /// lines in file order, then an appended `" "` (see [`ctc_labels`]).
 pub fn dict_len(file: &ModelFile) -> usize {
     match *file {
-        LATIN_DICT => 95,
+        LATIN_DICT => 502,
         ARABIC_DICT => 161,
         _ => unreachable!("not a dictionary"),
     }
@@ -400,7 +403,7 @@ mod tests {
     fn test_dictionary_keeps_file_order() {
         let dir = std::env::temp_dir().join(format!("lenslate-dict-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Unsorted, with a space entry like the upstream en_dict.txt.
+        // Unsorted, with a space entry like some upstream dictionaries.
         let p = dir.join("d.txt");
         std::fs::write(&p, "z\na\nM\n0\n \n").unwrap();
         let dict = load_dictionary(&p).unwrap();
