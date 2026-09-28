@@ -135,10 +135,11 @@ pub enum OcrEvent {
         ms: u64,
         script: Script,
     },
-    /// Model download/load state
+    /// Model download/load state; `message` explains an error
     Models {
         state: ModelState,
         progress: Option<f32>,
+        message: Option<String>,
     },
     /// OCR error
     Error { message: String },
@@ -203,7 +204,8 @@ mod tests {
         assert_eq!(
             OcrEvent::Models {
                 state: ModelState::Ready,
-                progress: None
+                progress: None,
+                message: None
             }
             .event_name(),
             "ocr://models"
