@@ -34,3 +34,19 @@ src-tauri/gen
 .eslintcache
 *.tsbuildinfo
 .vite
+
+# Ad-hoc scripts and debug leftovers (put real scripts in scripts/)
+/*.py
+/*.sh
+debug_*
+*.orig
+*.bak
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local agent/tool state
+.claude/
+.serena/
+.freebuff/
