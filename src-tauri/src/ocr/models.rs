@@ -12,8 +12,8 @@ pub struct ModelFile {
     pub path: &'static str,
     pub url: &'static str,
     pub size: u64,
-    /// SHA-256 computed locally from the bytes served at `url` (see
-    /// `examples/fetch_models.rs`); models are never committed to git.
+    /// SHA-256 of the bytes served at `url`; models are never committed to
+    /// git.
     pub sha256: &'static str,
 }
 
@@ -66,8 +66,9 @@ pub const ALL_MODELS: [ModelFile; 5] = [
     ARABIC_DICT,
 ];
 
-/// CTC decode: the model predicts `dict_len + 1` classes; the extra one is the
-/// CTC "blank". Asserted at load time in `engine.rs`.
+/// Number of entries in each upstream dictionary file. The recognizer
+/// predicts `dict_len + 2` classes: the CTC blank at index 0, the dictionary
+/// lines in file order, then an appended `" "` (see [`ctc_labels`]).
 pub fn dict_len(file: &ModelFile) -> usize {
     match *file {
         LATIN_DICT => 95,
@@ -213,33 +214,43 @@ fn purge_invalid(dir: &Path) -> OcrResult<()> {
 // ---------------------------------------------------------------------------
 
 const RETRIES: u32 = 3;
+/// Shown when the model host cannot be reached at all.
+pub const OFFLINE_HINT: &str =
+    "Cannot download the OCR models: no internet connection. Connect once to download them (about 20 MB); they are kept for offline use";
 const BACKOFF: Duration = Duration::from_millis(750);
 
-/// Download one artifact into `dir`, with 3 attempts, a temp file, and a
-/// checksum gate. `progress` is the overall completion in `0.0..=1.0`.
-fn download_one(
-    dir: &Path,
-    model: &ModelFile,
-    _reporter: &dyn ProgressReporter,
-    progress: impl Fn(f32),
-) -> OcrResult<()> {
+/// True for errors that mean "no network" rather than a bad server reply.
+fn is_offline(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout()
+}
+
+/// Download one artifact into `dir` with up to 3 attempts, streaming into a
+/// temp file behind a size and checksum gate. `progress` receives this
+/// file's completion in `0.0..=1.0`.
+fn download_one(dir: &Path, model: &ModelFile, progress: impl Fn(f32)) -> OcrResult<()> {
+    use std::io::{Read, Write};
+
     let dest = dir.join(model.path);
     let tmp = dir.join(format!("{}.part", model.path));
     let _ = std::fs::remove_file(&tmp);
 
     let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(300))
         .user_agent("LensLate/0.1 (ocr models)")
         .build()
         .map_err(|e| OcrError::Download(format!("client: {e}")))?;
 
-    let mut last_err = String::new();
+    let mut last_err = None;
     for attempt in 1..=RETRIES {
         let result = (|| -> OcrResult<()> {
-            let resp = client
-                .get(model.url)
-                .send()
-                .map_err(|e| OcrError::Download(format!("GET {}: {e}", model.url)))?;
+            let mut resp = client.get(model.url).send().map_err(|e| {
+                if is_offline(&e) {
+                    OcrError::Download(format!("{OFFLINE_HINT} ({e})"))
+                } else {
+                    OcrError::Download(format!("GET {}: {e}", model.url))
+                }
+            })?;
             let status = resp.status();
             if !status.is_success() {
                 return Err(OcrError::Download(format!(
@@ -247,18 +258,32 @@ fn download_one(
                     model.url
                 )));
             }
-            let bytes = resp
-                .bytes()
-                .map_err(|e| OcrError::Download(format!("body: {e}")))?;
-            if bytes.len() as u64 != model.size {
+            let mut file = std::fs::File::create(&tmp)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut done = 0u64;
+            let mut reported = 0u64;
+            loop {
+                let n = resp
+                    .read(&mut buf)
+                    .map_err(|e| OcrError::Download(format!("{}: {e}", model.name)))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+                done += n as u64;
+                // report roughly every 1% of the file
+                if done - reported >= model.size / 100 {
+                    reported = done;
+                    progress((done as f32 / model.size as f32).min(1.0));
+                }
+            }
+            file.flush()?;
+            if done != model.size {
                 return Err(OcrError::Download(format!(
-                    "{}: expected {} bytes, got {}",
-                    model.name,
-                    model.size,
-                    bytes.len()
+                    "{}: expected {} bytes, got {done}",
+                    model.name, model.size
                 )));
             }
-            std::fs::write(&tmp, &bytes)?;
             Ok(())
         })();
 
@@ -277,19 +302,19 @@ fn download_one(
                 return Ok(());
             }
             Err(e) => {
-                last_err = e.to_string();
                 let _ = std::fs::remove_file(&tmp);
                 eprintln!(
-                    "[lenslate] ocr models {} attempt {attempt}/{RETRIES} failed: {last_err}",
+                    "[lenslate] ocr models {} attempt {attempt}/{RETRIES} failed: {e}",
                     model.name
                 );
+                last_err = Some(e);
                 if attempt < RETRIES {
                     std::thread::sleep(BACKOFF * attempt);
                 }
             }
         }
     }
-    Err(OcrError::Download(format!("{}: {last_err}", model.name)))
+    Err(last_err.unwrap_or_else(|| OcrError::Download(model.name.to_string())))
 }
 
 /// Make sure every model in `dir` is downloaded and verified, reporting
@@ -308,26 +333,25 @@ pub fn ensure_models(dir: &Path, reporter: &dyn ProgressReporter) -> OcrResult<(
     }
 
     if !all_present(dir) {
-        reporter.report(
-            ModelState::Missing,
-            None,
-            "models not downloaded yet, run `cargo run --example fetch_models`",
-        );
+        reporter.report(ModelState::Missing, None, "models not downloaded yet");
     }
 
     let needed: Vec<&ModelFile> = ALL_MODELS
         .iter()
         .filter(|m| !verify(&dir.join(m.path), m.sha256))
         .collect();
-    let total = needed.len() as f32;
+    // progress is weighted by bytes: the dictionaries are tiny
+    let total: u64 = needed.iter().map(|m| m.size).sum();
     reporter.report(ModelState::Downloading, Some(0.0), "starting");
 
-    for (i, model) in needed.iter().enumerate() {
-        let base = i as f32 / total;
-        let step = 1.0 / total;
-        let inner =
-            |p: f32| reporter.report(ModelState::Downloading, Some(base + p * step), model.name);
-        download_one(dir, model, reporter, inner)?;
+    let mut done = 0u64;
+    for model in needed {
+        let inner = |p: f32| {
+            let overall = (done as f32 + p * model.size as f32) / total as f32;
+            reporter.report(ModelState::Downloading, Some(overall), model.name)
+        };
+        download_one(dir, model, inner)?;
+        done += model.size;
     }
 
     debug_assert!(all_present_and_verified(dir));
@@ -346,26 +370,26 @@ pub fn ensure_models_reported(dir: &Path, reporter: &dyn ProgressReporter) -> Oc
     }
 }
 
-/// Load a dictionary file into CTC classes: `dict` + the blank at index
-/// `dict.len()`. Keys are sorted so lookup is `binary_search`.
+/// Load a dictionary file: one label per line, in file order.
 ///
-/// The upstream dict files are one plain UTF-8 entry per line. A single
+/// The order is the model's class order and must never change. A single
 /// literal `\n` in a line is a PaddleOCR convention for a "newline" label;
 /// it is unescaped here rather than dropped.
 pub fn load_dictionary(path: &Path) -> OcrResult<Vec<String>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| OcrError::Model(format!("dictionary {}: {e}", path.display())))?;
-    let mut classes: Vec<String> = text
-        .lines()
-        .map(|line| line.replace("\\n", "\n"))
-        .filter(|l| !l.is_empty())
-        .collect();
-    classes.dedup();
-    classes.sort();
-    classes.push(String::new()); // CTC blank at highest index
-                                 // Some ONNX exports include an additional class (OOV or padding)
-    classes.push(String::new()); // extra class to reach dict_len + 2
-    Ok(classes)
+    Ok(text.lines().map(|line| line.replace("\\n", "\n")).collect())
+}
+
+/// CTC class labels in PaddleOCR order: index 0 is the blank (empty label),
+/// then the dictionary in file order, then `" "` (PaddleOCR `use_space_char`).
+/// Class `i > 0` decodes to `dict[i - 1]`; there are `dict.len() + 2` classes.
+pub fn ctc_labels(dict: Vec<String>) -> Vec<String> {
+    let mut labels = Vec::with_capacity(dict.len() + 2);
+    labels.push(String::new());
+    labels.extend(dict);
+    labels.push(" ".to_string());
+    labels
 }
 
 #[cfg(test)]
@@ -373,17 +397,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dict_lengths_match_metadata() {
+    fn test_dictionary_keeps_file_order() {
         let dir = std::env::temp_dir().join(format!("lenslate-dict-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // Synthesize a dictionary with the documented length and check that
-        // `load_dictionary` produces dict_len + 2 classes (blank + extra).
+        // Unsorted, with a space entry like the upstream en_dict.txt.
         let p = dir.join("d.txt");
-        std::fs::write(&p, (0..161).map(|i| format!("c{i}\n")).collect::<String>()).unwrap();
-        let classes = load_dictionary(&p).unwrap();
-        assert_eq!(classes.len(), 163);
-        assert_eq!(classes[162], "", "blank must be the highest index");
+        std::fs::write(&p, "z\na\nM\n0\n \n").unwrap();
+        let dict = load_dictionary(&p).unwrap();
+        assert_eq!(dict, ["z", "a", "M", "0", " "]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ctc_labels_layout() {
+        let dict: Vec<String> = (0..161).map(|i| format!("c{i}")).collect();
+        let labels = ctc_labels(dict);
+        assert_eq!(labels.len(), 161 + 2);
+        assert_eq!(labels[0], "", "blank must be index 0");
+        assert_eq!(labels[1], "c0", "class i decodes to dict[i - 1]");
+        assert_eq!(labels[161], "c160");
+        assert_eq!(labels[162], " ", "space is appended last");
     }
 
     #[test]
