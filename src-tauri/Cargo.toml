@@ -29,7 +29,7 @@ image = "0.25"
 xcap = "0.9"
 dirs = "5.0"
 thiserror = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 base64 = "0.22"
 png = "0.18"
 chrono = { version = "0.4", features = ["serde"] }
@@ -49,12 +49,29 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
+    "json",
+] }
+
+# Translation (Phase 4)
+async-trait = "0.1"
+lru = "0.12"
+urlencoding = "2"
+sys-locale = "0.3"
+keyring = { version = "3.6", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
 ] }
 
 # Wayland capture (xdg-desktop-portal + PipeWire) exists only on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", features = ["screencast"] }
 pipewire = { version = "0.9", features = ["v0_3_77"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [[example]]

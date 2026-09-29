@@ -1,4 +1,4 @@
-use crate::capture::{CaptureError, CaptureResult, ScreenCapture};
+use crate::capture::{CaptureError, CaptureResult, MonitorFrame, ScreenCapture};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, ResponseError, Session};
 use ashpd::enumflags2::BitFlags;
@@ -12,18 +12,25 @@ use pipewire::spa::pod::{Object, Pod, Property, PropertyFlags, Value};
 use pipewire::spa::sys as spa_sys;
 use pipewire::spa::utils::Direction;
 use pipewire::stream::{StreamRc, StreamState};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Cursor;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const RESTORE_TOKEN_FILE: &str = "lenslate-restore-token";
 const CAPTURE_ONCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the screen-share dialog (and the streams behind it).
+pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// After the first monitor answered a one-shot capture, how long to wait for
+/// the others (idle monitors may not send a picture at all).
+const OTHER_MONITORS_GRACE: Duration = Duration::from_millis(300);
 
 fn get_token_path() -> PathBuf {
     let mut path = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -45,10 +52,28 @@ fn pw_err(e: pw::Error) -> CaptureError {
 }
 
 enum WorkerCommand {
-    StartStream { fps: u32, tx: Sender<RgbaImage> },
+    StartStream { fps: u32, tx: Sender<MonitorFrame> },
     Stop,
-    CaptureOnce(Sender<CaptureResult<RgbaImage>>),
+    CaptureOnce(Sender<MonitorFrame>),
     Shutdown,
+}
+
+/// A monitor shared through the portal.
+#[derive(Clone, Debug)]
+struct SharedMonitor {
+    node_id: u32,
+    name: String,
+}
+
+fn monitor_name(index: usize, stream: &ashpd::desktop::screencast::Stream) -> String {
+    let mut name = format!("portal-{index}");
+    if let Some((x, y)) = stream.position() {
+        name.push_str(&format!("@{x},{y}"));
+    }
+    if let Some((w, h)) = stream.size() {
+        name.push_str(&format!("({w}x{h})"));
+    }
+    name
 }
 
 /// Video format received from the param_changed callback
@@ -60,16 +85,37 @@ struct VideoFormatState {
 }
 
 /// Where converted frames go. Lives on the PipeWire worker thread only.
-#[derive(Default)]
 struct Sinks {
-    live: Option<(Sender<RgbaImage>, Duration)>,
-    last_live: Option<Instant>,
-    once: Option<Sender<CaptureResult<RgbaImage>>>,
+    live: Option<(Sender<MonitorFrame>, Duration)>,
+    /// Per stream: when a live picture was last sent.
+    last_live: Vec<Option<Instant>>,
+    /// One-shot request and the streams that still owe it a picture.
+    once: Option<(Sender<MonitorFrame>, Vec<bool>)>,
 }
 
 impl Sinks {
+    fn new(streams: usize) -> Self {
+        Self {
+            live: None,
+            last_live: vec![None; streams],
+            once: None,
+        }
+    }
+
     fn wants_frames(&self) -> bool {
         self.live.is_some() || self.once.is_some()
+    }
+
+    fn live_due(&self, index: usize) -> bool {
+        match (&self.live, self.last_live[index]) {
+            (Some((_, interval)), Some(last)) => last.elapsed() >= *interval,
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    fn once_wants(&self, index: usize) -> bool {
+        self.once.as_ref().is_some_and(|(_, owed)| owed[index])
     }
 }
 
@@ -77,22 +123,48 @@ impl Sinks {
 struct Worker {
     tx: pw::channel::Sender<WorkerCommand>,
     handle: JoinHandle<()>,
+    monitors: usize,
 }
+
+/// Told `true` while the screen-share dialog may be open, `false` after.
+pub type PortalStatus = Box<dyn Fn(bool) + Send>;
 
 pub struct WaylandCapture {
     worker: Option<Worker>,
+    on_portal: Option<PortalStatus>,
+    /// Latest one-shot picture of each shared monitor, used for monitors that
+    /// stay idle (send no new picture) during a one-shot capture.
+    last_frames: Vec<Option<MonitorFrame>>,
 }
 
 impl WaylandCapture {
     pub fn new() -> Self {
-        Self { worker: None }
+        Self {
+            worker: None,
+            on_portal: None,
+            last_frames: Vec::new(),
+        }
+    }
+
+    pub fn with_portal_status(mut self, on_portal: PortalStatus) -> Self {
+        self.on_portal = Some(on_portal);
+        self
     }
 
     fn send(&mut self, cmd: WorkerCommand) -> CaptureResult<()> {
         // Respawn if the stream ended (e.g. the user stopped sharing).
         let worker = match self.worker.take() {
             Some(worker) if !worker.handle.is_finished() => worker,
-            _ => spawn_worker()?,
+            _ => {
+                if let Some(status) = &self.on_portal {
+                    status(true);
+                }
+                let spawned = spawn_worker(PORTAL_TIMEOUT);
+                if let Some(status) = &self.on_portal {
+                    status(false);
+                }
+                spawned?
+            }
         };
         let result = worker
             .tx
@@ -103,45 +175,75 @@ impl WaylandCapture {
     }
 }
 
-fn spawn_worker() -> CaptureResult<Worker> {
+/// Start the worker thread (portal dialog, then PipeWire streams). Gives up
+/// after `timeout`; an abandoned worker closes its session and exits as soon
+/// as the portal answers.
+fn spawn_worker(timeout: Duration) -> CaptureResult<Worker> {
     let (tx, rx) = pw::channel::channel::<WorkerCommand>();
-    let (ready_tx, ready_rx) = mpsc::channel::<CaptureResult<()>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<CaptureResult<usize>>();
+    let abandoned = Arc::new(AtomicBool::new(false));
 
+    let worker_abandoned = abandoned.clone();
     let handle = thread::Builder::new()
         .name("lenslate-pipewire".into())
         .spawn(move || {
-            if let Err(e) = run_worker(rx, &ready_tx) {
+            if let Err(e) = run_worker(rx, &ready_tx, timeout, &worker_abandoned) {
                 let _ = ready_tx.send(Err(e));
             }
         })?;
 
-    match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Worker { tx, handle }),
+    // A little longer than the worker's own portal timeout, so its error wins.
+    match ready_rx.recv_timeout(timeout + Duration::from_secs(5)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            eprintln!("[lenslate] capture: screen-share permission timed out");
+            Err(CaptureError::Portal(
+                "Timed out waiting for screen-share permission".into(),
+            ))
+        }
+        Ok(Ok(monitors)) => Ok(Worker {
+            tx,
+            handle,
+            monitors,
+        }),
         Ok(Err(e)) => {
             let _ = handle.join();
             Err(e)
         }
-        Err(_) => Err(CaptureError::PipeWire("Worker thread died".into())),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CaptureError::PipeWire("Worker thread died".into()))
+        }
     }
 }
 
 fn run_worker(
     rx: pw::channel::Receiver<WorkerCommand>,
-    ready_tx: &Sender<CaptureResult<()>>,
+    ready_tx: &Sender<CaptureResult<usize>>,
+    timeout: Duration,
+    abandoned: &AtomicBool,
 ) -> CaptureResult<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    let (screencast, session, node_id, fd) = rt.block_on(open_portal())?;
-    let result = run_pipewire(fd, node_id, rx, ready_tx);
+    let (screencast, session, monitors, fd) = rt
+        .block_on(async { tokio::time::timeout(timeout, open_portal()).await })
+        .map_err(|_| {
+            CaptureError::Portal("Timed out waiting for screen-share permission".into())
+        })??;
+    if abandoned.load(Ordering::SeqCst) {
+        let _ = rt.block_on(session.close());
+        return Ok(());
+    }
+    let result = run_pipewire(fd, &monitors, rx, ready_tx);
 
     let _ = rt.block_on(session.close());
     drop(screencast);
     result
 }
 
-async fn open_portal() -> CaptureResult<(Screencast, Session<Screencast>, u32, OwnedFd)> {
+async fn open_portal(
+) -> CaptureResult<(Screencast, Session<Screencast>, Vec<SharedMonitor>, OwnedFd)> {
     let screencast = Screencast::new().await.map_err(portal_err)?;
     let session = screencast
         .create_session(Default::default())
@@ -149,11 +251,13 @@ async fn open_portal() -> CaptureResult<(Screencast, Session<Screencast>, u32, O
         .map_err(portal_err)?;
 
     let restore_token = fs::read_to_string(get_token_path()).ok();
-    // Monitor only: the marker frame is a separate window, so a window source never contains it.
+    // Monitors only: the marker frame is a separate window, so a window source
+    // never contains it. Several monitors may be shared; the frame is searched
+    // on each of them.
     let options = SelectSourcesOptions::default()
         .set_cursor_mode(CursorMode::Hidden)
         .set_sources(BitFlags::from(SourceType::Monitor))
-        .set_multiple(false)
+        .set_multiple(true)
         .set_persist_mode(PersistMode::ExplicitlyRevoked)
         .set_restore_token(restore_token.as_deref());
     screencast
@@ -173,18 +277,27 @@ async fn open_portal() -> CaptureResult<(Screencast, Session<Screencast>, u32, O
         let _ = fs::write(get_token_path(), token);
     }
 
-    let node_id = streams
+    let monitors: Vec<SharedMonitor> = streams
         .streams()
-        .first()
-        .ok_or(CaptureError::NoMonitor)?
-        .pipe_wire_node_id();
+        .iter()
+        .enumerate()
+        .map(|(i, stream)| SharedMonitor {
+            node_id: stream.pipe_wire_node_id(),
+            name: monitor_name(i, stream),
+        })
+        .collect();
+    if monitors.is_empty() {
+        return Err(CaptureError::NoMonitor);
+    }
+    let names: Vec<&str> = monitors.iter().map(|m| m.name.as_str()).collect();
+    eprintln!("[lenslate] portal shared monitors={names:?}");
 
     let fd = screencast
         .open_pipe_wire_remote(&session, Default::default())
         .await
         .map_err(portal_err)?;
 
-    Ok((screencast, session, node_id, fd))
+    Ok((screencast, session, monitors, fd))
 }
 
 fn serialize_pod_object(obj: Object) -> Option<Vec<u8>> {
@@ -270,142 +383,178 @@ fn shm_buffers_param() -> Option<Vec<u8>> {
 
 fn run_pipewire(
     fd: OwnedFd,
-    node_id: u32,
+    monitors: &[SharedMonitor],
     rx: pw::channel::Receiver<WorkerCommand>,
-    ready_tx: &Sender<CaptureResult<()>>,
+    ready_tx: &Sender<CaptureResult<usize>>,
 ) -> CaptureResult<()> {
     let main_loop = MainLoopRc::new(None).map_err(pw_err)?;
     let context = ContextRc::new(&main_loop, None).map_err(pw_err)?;
     // Connect to the PipeWire remote handed out by the portal, not the default daemon.
     let core = context.connect_fd_rc(fd, None).map_err(pw_err)?;
-    let stream = StreamRc::new(core, "lenslate-capture", PropertiesBox::new()).map_err(pw_err)?;
 
-    let format = Rc::new(RefCell::new(None::<VideoFormatState>));
-    let sinks = Rc::new(RefCell::new(Sinks::default()));
+    let sinks = Rc::new(RefCell::new(Sinks::new(monitors.len())));
+    // Streams that ended; the worker stops when all of them did.
+    let dead = Rc::new(Cell::new(0usize));
+    let mut streams = Vec::new();
+    let mut listeners = Vec::new();
 
-    let _listener = stream
-        .add_local_listener::<()>()
-        .state_changed({
-            let main_loop = main_loop.clone();
-            move |_, _: &mut (), _, new| {
-                if matches!(new, StreamState::Error(_) | StreamState::Unconnected) {
-                    main_loop.quit();
-                }
-            }
-        })
-        .param_changed({
-            let format = format.clone();
-            move |stream, _: &mut (), id, param| {
-                if id != spa_sys::SPA_PARAM_Format {
-                    return;
-                }
-                let Some(param) = param else {
-                    return;
-                };
-                let mut info = VideoInfoRaw::new();
-                if info.parse(param).is_err() {
-                    return;
-                }
-                *format.borrow_mut() = Some(VideoFormatState {
-                    width: info.size().width,
-                    height: info.size().height,
-                    format: info.format(),
-                });
+    for (index, monitor) in monitors.iter().enumerate() {
+        let stream = StreamRc::new(
+            core.clone(),
+            &format!("lenslate-capture-{index}"),
+            PropertiesBox::new(),
+        )
+        .map_err(pw_err)?;
+        let format = Rc::new(RefCell::new(None::<VideoFormatState>));
+        let name = monitor.name.clone();
+        let total = monitors.len();
 
-                let buffers = shm_buffers_param();
-                if let Some(pod) = buffers.as_deref().and_then(Pod::from_bytes) {
-                    let _ = stream.update_params(&mut [pod]);
-                }
-            }
-        })
-        .process({
-            let format = format.clone();
-            let sinks = sinks.clone();
-            move |stream, _: &mut ()| {
-                let Some(mut buffer) = stream.dequeue_buffer() else {
-                    return;
-                };
-                let mut sinks = sinks.borrow_mut();
-                let live_due = match (&sinks.live, sinks.last_live) {
-                    (Some((_, interval)), Some(last)) => last.elapsed() >= *interval,
-                    (Some(_), None) => true,
-                    (None, _) => false,
-                };
-                if !live_due && sinks.once.is_none() {
-                    return;
-                }
-                let Some(vf) = *format.borrow() else {
-                    return;
-                };
-                let Some(data) = buffer.datas_mut().first_mut() else {
-                    return;
-                };
-                let Some(img) = convert_frame(data, vf) else {
-                    return;
-                };
-
-                if let Some(tx) = sinks.once.take() {
-                    let _ = tx.send(Ok(img.clone()));
-                }
-                if live_due {
-                    let sent = sinks.live.as_ref().map(|(tx, _)| tx.send(img).is_ok());
-                    match sent {
-                        Some(true) => sinks.last_live = Some(Instant::now()),
-                        Some(false) => sinks.live = None,
-                        None => {}
+        let listener = stream
+            .add_local_listener::<()>()
+            .state_changed({
+                let main_loop = main_loop.clone();
+                let dead = dead.clone();
+                let name = name.clone();
+                move |_, _: &mut (), _, new| {
+                    if matches!(new, StreamState::Error(_) | StreamState::Unconnected) {
+                        eprintln!("[lenslate] capture stream {name} ended ({new:?})");
+                        dead.set(dead.get() + 1);
+                        if dead.get() >= total {
+                            main_loop.quit();
+                        }
                     }
                 }
-                if !sinks.wants_frames() {
-                    let _ = stream.set_active(false);
+            })
+            .param_changed({
+                let format = format.clone();
+                move |stream, _: &mut (), id, param| {
+                    if id != spa_sys::SPA_PARAM_Format {
+                        return;
+                    }
+                    let Some(param) = param else {
+                        return;
+                    };
+                    let mut info = VideoInfoRaw::new();
+                    if info.parse(param).is_err() {
+                        return;
+                    }
+                    *format.borrow_mut() = Some(VideoFormatState {
+                        width: info.size().width,
+                        height: info.size().height,
+                        format: info.format(),
+                    });
+
+                    let buffers = shm_buffers_param();
+                    if let Some(pod) = buffers.as_deref().and_then(Pod::from_bytes) {
+                        let _ = stream.update_params(&mut [pod]);
+                    }
                 }
-            }
-        })
-        .register()
-        .map_err(pw_err)?;
+            })
+            .process({
+                let format = format.clone();
+                let sinks = sinks.clone();
+                move |stream, _: &mut ()| {
+                    let Some(mut buffer) = stream.dequeue_buffer() else {
+                        return;
+                    };
+                    let mut sinks = sinks.borrow_mut();
+                    let live_due = sinks.live_due(index);
+                    let once_due = sinks.once_wants(index);
+                    if !live_due && !once_due {
+                        return;
+                    }
+                    let Some(vf) = *format.borrow() else {
+                        return;
+                    };
+                    let Some(data) = buffer.datas_mut().first_mut() else {
+                        return;
+                    };
+                    let Some(image) = convert_frame(data, vf) else {
+                        return;
+                    };
+                    let frame = MonitorFrame {
+                        index,
+                        name: name.clone(),
+                        image,
+                    };
+
+                    if once_due {
+                        if let Some((tx, owed)) = sinks.once.as_mut() {
+                            let _ = tx.send(frame.clone());
+                            owed[index] = false;
+                            if !owed.contains(&true) {
+                                sinks.once = None;
+                            }
+                        }
+                    }
+                    if live_due {
+                        let sent = sinks.live.as_ref().map(|(tx, _)| tx.send(frame).is_ok());
+                        match sent {
+                            Some(true) => sinks.last_live[index] = Some(Instant::now()),
+                            Some(false) => sinks.live = None,
+                            None => {}
+                        }
+                    }
+                    if !sinks.wants_frames() {
+                        let _ = stream.set_active(false);
+                    }
+                }
+            })
+            .register()
+            .map_err(pw_err)?;
+
+        let format_param = enum_format_param();
+        let mut params: Vec<&Pod> = format_param
+            .as_deref()
+            .and_then(Pod::from_bytes)
+            .into_iter()
+            .collect();
+        stream
+            .connect(
+                Direction::Input,
+                Some(monitor.node_id),
+                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                &mut params,
+            )
+            .map_err(pw_err)?;
+        streams.push(stream);
+        listeners.push(listener);
+    }
 
     let _commands = rx.attach(main_loop.loop_(), {
         let main_loop = main_loop.clone();
-        let stream = stream.clone();
+        let streams = streams.clone();
         let sinks = sinks.clone();
+        let count = monitors.len();
         move |cmd| {
             let mut sinks = sinks.borrow_mut();
             match cmd {
                 WorkerCommand::StartStream { fps, tx } => {
                     let interval = Duration::from_millis(1000 / u64::from(fps.max(1)));
                     sinks.live = Some((tx, interval));
-                    sinks.last_live = None;
+                    sinks.last_live = vec![None; count];
                 }
                 WorkerCommand::Stop => sinks.live = None,
-                WorkerCommand::CaptureOnce(tx) => sinks.once = Some(tx),
+                WorkerCommand::CaptureOnce(tx) => sinks.once = Some((tx, vec![true; count])),
                 WorkerCommand::Shutdown => {
                     sinks.live = None;
                     sinks.once = None;
                     main_loop.quit();
                 }
             }
-            let _ = stream.set_active(sinks.wants_frames());
+            for stream in &streams {
+                let _ = stream.set_active(sinks.wants_frames());
+            }
         }
     });
 
-    let format_param = enum_format_param();
-    let mut params: Vec<&Pod> = format_param
-        .as_deref()
-        .and_then(Pod::from_bytes)
-        .into_iter()
-        .collect();
-    stream
-        .connect(
-            Direction::Input,
-            Some(node_id),
-            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut params,
-        )
-        .map_err(pw_err)?;
-
-    let _ = ready_tx.send(Ok(()));
+    let _ = ready_tx.send(Ok(monitors.len()));
     main_loop.run();
 
-    let _ = stream.disconnect();
+    drop(listeners);
+    for stream in &streams {
+        let _ = stream.disconnect();
+    }
     Ok(())
 }
 
@@ -452,14 +601,44 @@ fn convert_frame(data: &mut pw::spa::buffer::Data, vf: VideoFormatState) -> Opti
 }
 
 impl ScreenCapture for WaylandCapture {
-    fn capture_monitor(&mut self) -> CaptureResult<RgbaImage> {
+    fn capture_monitors(&mut self) -> CaptureResult<Vec<MonitorFrame>> {
         let (tx, rx) = mpsc::channel();
         self.send(WorkerCommand::CaptureOnce(tx))?;
-        rx.recv_timeout(CAPTURE_ONCE_TIMEOUT)
-            .map_err(|_| CaptureError::PipeWire("Timeout waiting for frame".into()))?
+        let monitors = self.worker.as_ref().map_or(1, |w| w.monitors);
+        if self.last_frames.len() != monitors {
+            self.last_frames = vec![None; monitors];
+        }
+
+        let first = rx
+            .recv_timeout(CAPTURE_ONCE_TIMEOUT)
+            .map_err(|_| CaptureError::PipeWire("Timeout waiting for frame".into()))?;
+        let mut fresh = vec![first];
+        let deadline = Instant::now() + OTHER_MONITORS_GRACE;
+        while fresh.len() < monitors {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(frame) => fresh.push(frame),
+                Err(_) => break,
+            }
+        }
+        for frame in &fresh {
+            if let Some(slot) = self.last_frames.get_mut(frame.index) {
+                *slot = Some(frame.clone());
+            }
+        }
+        // Idle monitors: search their latest picture after the fresh ones.
+        let stale = self
+            .last_frames
+            .iter()
+            .flatten()
+            .filter(|old| fresh.iter().all(|f| f.index != old.index))
+            .cloned()
+            .collect::<Vec<_>>();
+        fresh.extend(stale);
+        Ok(fresh)
     }
 
-    fn start_stream(&mut self, fps: u32, tx: Sender<RgbaImage>) -> CaptureResult<()> {
+    fn start_stream(&mut self, fps: u32, tx: Sender<MonitorFrame>) -> CaptureResult<()> {
         self.send(WorkerCommand::StartStream { fps, tx })
     }
 
@@ -474,6 +653,18 @@ impl ScreenCapture for WaylandCapture {
             let _ = worker.tx.send(WorkerCommand::Shutdown);
             let _ = worker.handle.join();
         }
+    }
+
+    fn reselect(&mut self) {
+        eprintln!("[lenslate] capture: asking for the screens again");
+        self.shutdown();
+        self.last_frames.clear();
+        // Without the token the portal shows its dialog again.
+        let _ = fs::remove_file(get_token_path());
+    }
+
+    fn shared_monitors(&self) -> Option<usize> {
+        self.worker.as_ref().map(|w| w.monitors)
     }
 
     fn is_wayland(&self) -> bool {

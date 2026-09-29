@@ -98,6 +98,14 @@ impl Rect {
     }
 }
 
+/// Background and text colour of the page behind one OCR line, used to
+/// cover the line when the translation is drawn in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineColors {
+    pub bg: [u8; 3],
+    pub fg: [u8; 3],
+}
+
 /// Full OCR result with all lines and combined text
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -106,6 +114,14 @@ pub struct OcrResultData {
     pub text: String,
     pub ms: u64,
     pub script: Script,
+    /// Size of the recognized image; line rects are in its pixels.
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    /// One entry per line (filled by the app, empty from the engine).
+    #[serde(default)]
+    pub colors: Vec<LineColors>,
 }
 
 impl OcrResultData {
@@ -129,12 +145,7 @@ pub trait OcrEngine: Send {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum OcrEvent {
     /// OCR recognition result
-    Result {
-        text: String,
-        lines: Vec<OcrLine>,
-        ms: u64,
-        script: Script,
-    },
+    Result(OcrResultData),
     /// Model download/load state; `message` explains an error
     Models {
         state: ModelState,
@@ -211,12 +222,15 @@ mod tests {
             "ocr://models"
         );
         assert_eq!(
-            OcrEvent::Result {
+            OcrEvent::Result(OcrResultData {
                 text: "t".into(),
                 lines: vec![],
                 ms: 1,
-                script: Script::Auto
-            }
+                script: Script::Auto,
+                width: 0,
+                height: 0,
+                colors: vec![],
+            })
             .event_name(),
             "ocr://result"
         );

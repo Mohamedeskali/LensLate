@@ -12,15 +12,24 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 mod capture;
 pub mod ocr;
 mod ocr_service;
+mod settings;
+pub mod translate;
+mod translate_service;
 
+use capture::multi::{locate_in_frames, LiveLocator, Observation};
+use capture::overlay::{Decision, OverlayGuard};
 #[cfg(target_os = "linux")]
 use capture::wayland::WaylandCapture;
 use capture::xcap_backend::XCapCapture;
 use capture::{
-    crop_inside, frame_hash, locate_frame, CaptureEvent, NoOpCapture, Rect, ScreenCapture, INSET_PX,
+    crop_inside, frame_hash, CaptureEvent, Located, MonitorFrame, NoOpCapture, Rect, ScreenCapture,
+    INSET_PX,
 };
 
 static FRAME_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Set once at startup; read without taking the capture lock, which the
+/// portal dialog may hold for a while.
+static WAYLAND_BACKEND: AtomicBool = AtomicBool::new(false);
 static LIVE_CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn toggle_frame(app: &AppHandle) {
@@ -33,6 +42,8 @@ fn toggle_frame(app: &AppHandle) {
     } else {
         let _ = frame.show();
         let _ = frame.set_focus();
+        // The frame translates once when it appears (hotkey / tray / --toggle).
+        let _ = app.emit("frame://shown", ());
     }
 }
 
@@ -48,8 +59,9 @@ fn show_utility(app: &AppHandle, label: &str, title: &str) {
         WebviewUrl::App(format!("index.html?view={label}").into()),
     )
     .title(title)
-    .inner_size(440.0, 320.0)
-    .resizable(false)
+    .inner_size(620.0, 560.0)
+    .min_inner_size(480.0, 400.0)
+    .resizable(true)
     .build();
 }
 
@@ -112,7 +124,15 @@ fn is_wayland_session() -> bool {
 fn create_capture_backend(window_label: String, app: &AppHandle) -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "linux")]
     if is_wayland_session() {
-        return Box::new(WaylandCapture::new());
+        let app = app.clone();
+        return Box::new(
+            WaylandCapture::new().with_portal_status(Box::new(move |waiting| {
+                let _ = app.emit(
+                    "capture://portal",
+                    serde_json::json!({ "waiting": waiting }),
+                );
+            })),
+        );
     }
     let mut backend = XCapCapture::new(window_label);
     backend.set_app_handle(app.clone());
@@ -121,32 +141,37 @@ fn create_capture_backend(window_label: String, app: &AppHandle) -> Box<dyn Scre
 
 struct CaptureState {
     backend: Box<dyn ScreenCapture>,
-    last_full_frame: Option<image::RgbaImage>,
+    last_frames: Vec<MonitorFrame>,
     last_cropped: Option<image::RgbaImage>,
-    last_rect: Option<Rect>,
-    frame_tx: Option<mpsc::Sender<image::RgbaImage>>,
+    last_located: Option<Located>,
     capture_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl CaptureState {
-    fn new(_window_label: String) -> Self {
+    fn new() -> Self {
         Self {
             backend: Box::new(NoOpCapture),
-            last_full_frame: None,
+            last_frames: Vec::new(),
             last_cropped: None,
-            last_rect: None,
-            frame_tx: None,
+            last_located: None,
             capture_thread: None,
         }
     }
 }
 
 static CAPTURE_STATE: std::sync::OnceLock<Arc<Mutex<CaptureState>>> = std::sync::OnceLock::new();
+/// Boxes our overlay draws inside the frame (see `capture::overlay`).
+static OVERLAY_GUARD: Mutex<Option<OverlayGuard>> = Mutex::new(None);
 
 fn get_capture_state() -> Arc<Mutex<CaptureState>> {
     CAPTURE_STATE
-        .get_or_init(|| Arc::new(Mutex::new(CaptureState::new("frame".to_string()))))
+        .get_or_init(|| Arc::new(Mutex::new(CaptureState::new())))
         .clone()
+}
+
+fn with_guard<T>(f: impl FnOnce(&mut OverlayGuard) -> T) -> T {
+    let mut guard = OVERLAY_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(OverlayGuard::new))
 }
 
 #[tauri::command]
@@ -178,6 +203,40 @@ fn is_frame_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// Number of monitors connected, as the windowing system reports them.
+fn monitor_count(app: &AppHandle) -> usize {
+    app.get_webview_window("frame")
+        .and_then(|w| w.available_monitors().ok())
+        .map_or(0, |m| m.len())
+}
+
+/// The portal shares only the monitors the user picked; true when some
+/// connected monitor is not among them (the frame may be there).
+fn missing_shared_monitors(app: &AppHandle, backend: &dyn ScreenCapture) -> bool {
+    backend
+        .shared_monitors()
+        .is_some_and(|shared| shared < monitor_count(app))
+}
+
+/// With `LENSLATE_DEBUG_CAPTURE=1`, save the searched pictures.
+fn dump_debug_frames<'a>(frames: impl IntoIterator<Item = &'a MonitorFrame>) {
+    if !capture::multi::debug_capture_enabled() {
+        return;
+    }
+    match capture::multi::save_debug_frames(frames, &capture::multi::debug_dir()) {
+        Ok(paths) => eprintln!("[lenslate] capture debug saved {paths:?}"),
+        Err(e) => eprintln!("[lenslate] capture debug save failed: {e}"),
+    }
+}
+
+fn log_located(located: &Located, extra: &str) {
+    let r = located.rect;
+    eprintln!(
+        "[lenslate] capture monitor={} frame={},{},{}x{}{extra}",
+        located.monitor, r.x, r.y, r.w, r.h
+    );
+}
+
 #[tauri::command]
 async fn capture_once() -> Result<CaptureEvent, String> {
     tauri::async_runtime::spawn_blocking(capture_once_blocking)
@@ -185,9 +244,9 @@ async fn capture_once() -> Result<CaptureEvent, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Capture the monitor, locate the frame and crop inside its border.
-fn capture_crop(state: &mut CaptureState) -> Result<(image::RgbaImage, Rect), String> {
-    let full_frame = state.backend.capture_monitor().map_err(|e| {
+/// Capture every monitor, find the frame and crop inside its border.
+fn capture_crop(state: &mut CaptureState) -> Result<(image::RgbaImage, Located), String> {
+    let frames = state.backend.capture_monitors().map_err(|e| {
         let msg = e.to_string();
         eprintln!("[lenslate] capture error: {}", msg);
         if msg.contains("Permission") || msg.contains("denied") {
@@ -196,68 +255,89 @@ fn capture_crop(state: &mut CaptureState) -> Result<(image::RgbaImage, Rect), St
             msg
         }
     })?;
-    let rect = locate_frame(&full_frame, state.last_rect);
-    state.last_full_frame = Some(full_frame);
-    let Some(r) = rect else {
+    let located = locate_in_frames(&frames, state.last_located.as_ref());
+    state.last_frames = frames;
+    let Some(located) = located else {
+        let names: Vec<String> = state.last_frames.iter().map(|f| format!("{f:?}")).collect();
+        eprintln!("[lenslate] capture found=no searched={names:?}");
+        dump_debug_frames(&state.last_frames);
         return Err("Frame not found".into());
     };
-    state.last_rect = Some(r);
-    let full_frame = state.last_full_frame.as_ref().expect("stored above");
-    let cropped = crop_inside(full_frame, r, INSET_PX);
+    log_located(&located, "");
+    let frame = state
+        .last_frames
+        .iter()
+        .find(|f| f.index == located.index)
+        .expect("located on one of the frames");
+    let cropped = crop_inside(&frame.image, located.rect, INSET_PX);
+    state.last_located = Some(located.clone());
     state.last_cropped = Some(cropped.clone());
-    Ok((cropped, r))
+    Ok((cropped, located))
+}
+
+/// `capture_crop`, asking the portal for the screens again once when the
+/// frame is on a monitor that is not shared.
+fn capture_crop_reselecting(
+    app: &AppHandle,
+    state: &mut CaptureState,
+) -> Result<(image::RgbaImage, Located), String> {
+    match capture_crop(state) {
+        Err(e)
+            if e == "Frame not found" && missing_shared_monitors(app, state.backend.as_ref()) =>
+        {
+            // Once per 文 press; the second result is final.
+            eprintln!(
+                "[lenslate] frame not on the shared monitors (shared={:?} connected={}); asking again",
+                state.backend.shared_monitors(),
+                monitor_count(app)
+            );
+            state.backend.reselect();
+            state.last_located = None;
+            capture_crop(state)
+        }
+        other => other,
+    }
 }
 
 fn capture_once_blocking() -> CaptureEvent {
     let state_arc = get_capture_state();
-    let mut state = state_arc.lock().unwrap();
+    let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
     let start = Instant::now();
 
     match capture_crop(&mut state) {
-        Ok((cropped, r)) => {
-            let thumbnail = create_thumbnail(&cropped);
-            let ms = start.elapsed().as_millis() as u64;
-            eprintln!(
-                "[lenslate] capture found=yes rect={},{},{}x{} ms={} skipped=0",
-                r.x, r.y, r.w, r.h, ms
-            );
-            CaptureEvent::Frame {
-                thumbnail_png_base64: thumbnail,
-                width: cropped.width(),
-                height: cropped.height(),
-                ms,
-                skipped: 0,
-            }
-        }
-        Err(message) => {
-            eprintln!(
-                "[lenslate] capture found=no ms={} skipped=0 ({message})",
-                start.elapsed().as_millis()
-            );
-            CaptureEvent::Error { message }
-        }
+        Ok((cropped, _)) => CaptureEvent::Frame {
+            thumbnail_png_base64: create_thumbnail(&cropped),
+            width: cropped.width(),
+            height: cropped.height(),
+            ms: start.elapsed().as_millis() as u64,
+            skipped: 0,
+        },
+        Err(message) => CaptureEvent::Error { message },
     }
 }
 
-/// 文: capture once, crop inside the frame and recognize the text.
+/// 文: capture once, crop inside the frame, recognize and translate the text.
 #[tauri::command]
 async fn ocr_once(app: AppHandle) -> Result<ocr::OcrResultData, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // The frontend hid its overlay; let the compositor repaint first.
+        let wait = with_guard(|g| g.settle_left(Instant::now()));
+        if !wait.is_zero() {
+            thread::sleep(wait);
+        }
         let start = Instant::now();
-        let (cropped, r) = {
+        let (cropped, _) = {
             let state_arc = get_capture_state();
             let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
-            capture_crop(&mut state)?
+            capture_crop_reselecting(&app, &mut state)?
         };
         eprintln!(
-            "[lenslate] capture found=yes rect={},{},{}x{} ms={} (ocr_once)",
-            r.x,
-            r.y,
-            r.w,
-            r.h,
+            "[lenslate] capture ms={} (ocr_once)",
             start.elapsed().as_millis()
         );
-        ocr_service::recognize(&app, &cropped, true)
+        let result = ocr_service::recognize(&app, &cropped, true)?;
+        translate_service::submit_now(&result);
+        Ok(result)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -272,6 +352,54 @@ fn set_ocr_script(script: ocr::Script) {
     ocr_service::invalidate_live();
 }
 
+/// The boxes (crop pixels) the frontend draws over the captured area; empty
+/// once it hid them.
+#[tauri::command]
+fn set_overlay_boxes(boxes: Vec<Rect>) {
+    let count = boxes.len();
+    with_guard(|g| g.set_boxes(boxes, Instant::now()));
+    if count == 0 {
+        // Read the page again once it is visible without our drawing.
+        ocr_service::invalidate_live();
+    }
+}
+
+/// Ask the portal for the screens to share again (Wayland).
+#[tauri::command]
+async fn capture_reselect() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let state_arc = get_capture_state();
+        let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
+        state.backend.reselect();
+        state.last_located = None;
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn capture_backend() -> &'static str {
+    if WAYLAND_BACKEND.load(Ordering::SeqCst) {
+        "wayland"
+    } else {
+        "xcap"
+    }
+}
+
+/// Hand a crop to OCR unless it shows our own overlay.
+fn process_live_crop(app: &AppHandle, cropped: &image::RgbaImage) {
+    match with_guard(|g| g.decide(cropped, Instant::now())) {
+        Decision::Ocr => {
+            ocr_service::offer_live(app, cropped, frame_hash(cropped));
+        }
+        Decision::Skip => {}
+        Decision::Suspend => {
+            eprintln!("[lenslate] page changed under the overlay; hiding it to read again");
+            let _ = app.emit("overlay://suspend", ());
+        }
+    }
+}
+
 #[tauri::command]
 async fn live_start(app: AppHandle) -> Result<(), String> {
     if LIVE_CAPTURE_RUNNING.swap(true, Ordering::SeqCst) {
@@ -279,13 +407,12 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
     }
 
     let state_arc = get_capture_state();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<MonitorFrame>();
 
     // Starting may block on the portal dialog, so keep it off the async runtime.
     let start_state = state_arc.clone();
     let started = tauri::async_runtime::spawn_blocking(move || {
-        let mut state = start_state.lock().unwrap();
-        state.frame_tx = Some(tx.clone());
+        let mut state = start_state.lock().unwrap_or_else(|e| e.into_inner());
         state.backend.start_stream(2, tx).map_err(|e| e.to_string())
     })
     .await
@@ -299,11 +426,12 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
     let app_handle = app.clone();
     let state_arc_clone = state_arc.clone();
     let handle = thread::spawn(move || {
+        const MAX_MISSING_REUSE: u32 = 3;
+        let mut locator = LiveLocator::new();
         let mut skipped = 0u64;
         let mut last_emit = Instant::now();
-        let mut last_rect: Option<Rect> = None;
-        let mut consecutive_missing = 0u32;
-        const MAX_MISSING_REUSE: u32 = 3;
+        let mut last_logged: Option<Located> = None;
+        let mut last_hash = 0u64;
 
         while LIVE_CAPTURE_RUNNING.load(Ordering::SeqCst) {
             if !is_frame_visible(&app_handle) {
@@ -311,106 +439,28 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                 let _ = app_handle.emit("capture://stopped", ());
                 break;
             }
-            let full_frame = if let Ok(frame) = rx.recv_timeout(Duration::from_millis(100)) {
-                frame
-            } else {
+            let Ok(frame) = rx.recv_timeout(Duration::from_millis(100)) else {
                 continue;
             };
-
             let start = Instant::now();
 
-            {
-                let mut state = state_arc_clone.lock().unwrap();
-                state.last_full_frame = Some(full_frame.clone());
-            }
-
-            let rect = locate_frame(&full_frame, last_rect);
-
-            match rect {
-                Some(r) => {
-                    consecutive_missing = 0;
-                    last_rect = Some(r);
-                    let cropped = crop_inside(&full_frame, r, INSET_PX);
-                    let hash = frame_hash(&cropped);
-                    ocr_service::offer_live(&app_handle, &cropped, hash);
-
-                    let should_emit = {
-                        let mut state = state_arc_clone.lock().unwrap();
-                        if state.last_cropped.as_ref().map(frame_hash) == Some(hash) {
-                            skipped += 1;
-                            false
-                        } else {
-                            state.last_cropped = Some(cropped.clone());
-                            state.last_rect = Some(r);
-                            true
-                        }
-                    };
-
-                    if should_emit && last_emit.elapsed() >= Duration::from_secs(1) {
-                        let thumbnail = create_thumbnail(&cropped);
-                        let ms = start.elapsed().as_millis() as u64;
-
-                        eprintln!(
-                            "[lenslate] capture found=yes rect={},{},{}x{} ms={} skipped={}",
-                            r.x, r.y, r.w, r.h, ms, skipped
-                        );
-
-                        let _ = app_handle.emit(
-                            "capture://frame",
-                            CaptureEvent::Frame {
-                                thumbnail_png_base64: thumbnail,
-                                width: cropped.width(),
-                                height: cropped.height(),
-                                ms,
-                                skipped,
-                            },
-                        );
-                        skipped = 0;
-                        last_emit = Instant::now();
-                    } else if should_emit {
-                        skipped += 1;
-                    }
+            let (located, reused) = match locator.observe(frame) {
+                Observation::Found(located) => (located, false),
+                Observation::Missing { last, consecutive } if consecutive <= MAX_MISSING_REUSE => {
+                    (last, true)
                 }
-                None => {
-                    consecutive_missing += 1;
+                Observation::Ignored => continue,
+                Observation::Missing { .. } | Observation::NotFound => {
                     skipped += 1;
-
-                    if consecutive_missing <= MAX_MISSING_REUSE {
-                        if let Some(r) = last_rect {
-                            let cropped = crop_inside(&full_frame, r, INSET_PX);
-                            let hash = frame_hash(&cropped);
-                            ocr_service::offer_live(&app_handle, &cropped, hash);
-
-                            if last_emit.elapsed() >= Duration::from_secs(1) {
-                                let thumbnail = create_thumbnail(&cropped);
-                                let ms = start.elapsed().as_millis() as u64;
-
-                                eprintln!(
-                                    "[lenslate] capture reuse rect={},{},{}x{} ms={} skipped={} missing={}/{}",
-                                    r.x, r.y, r.w, r.h, ms, skipped, consecutive_missing, MAX_MISSING_REUSE
-                                );
-
-                                let _ = app_handle.emit(
-                                    "capture://frame",
-                                    CaptureEvent::Frame {
-                                        thumbnail_png_base64: thumbnail,
-                                        width: cropped.width(),
-                                        height: cropped.height(),
-                                        ms,
-                                        skipped,
-                                    },
-                                );
-                                skipped = 0;
-                                last_emit = Instant::now();
-                            }
-                        }
-                    } else if last_emit.elapsed() > Duration::from_secs(1) {
+                    if last_emit.elapsed() > Duration::from_secs(1) {
+                        let state = state_arc_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        let unshared = missing_shared_monitors(&app_handle, state.backend.as_ref());
+                        drop(state);
                         eprintln!(
-                            "[lenslate] capture found=no rect=none ms={} skipped={} consecutive_missing={}",
-                            start.elapsed().as_millis(),
-                            skipped,
-                            consecutive_missing
+                            "[lenslate] capture found=no ms={} skipped={skipped} unshared_monitors={unshared}",
+                            start.elapsed().as_millis()
                         );
+                        dump_debug_frames(locator.frames());
                         let _ = app_handle.emit(
                             "capture://error",
                             CaptureEvent::Error {
@@ -419,16 +469,55 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                         );
                         last_emit = Instant::now();
                     }
+                    continue;
                 }
+            };
+            let Some(frame) = locator.frame(located.index) else {
+                continue;
+            };
+            if !reused && last_logged.as_ref() != Some(&located) {
+                log_located(&located, " (live)");
+                last_logged = Some(located.clone());
+            }
+            let cropped = crop_inside(&frame.image, located.rect, INSET_PX);
+            process_live_crop(&app_handle, &cropped);
+
+            let hash = frame_hash(&cropped);
+            if hash == last_hash {
+                skipped += 1;
+                continue;
+            }
+            last_hash = hash;
+            {
+                let mut state = state_arc_clone.lock().unwrap_or_else(|e| e.into_inner());
+                state.last_frames = vec![frame.clone()];
+                state.last_located = Some(located.clone());
+                state.last_cropped = Some(cropped.clone());
+            }
+            if last_emit.elapsed() >= Duration::from_secs(1) {
+                let _ = app_handle.emit(
+                    "capture://frame",
+                    CaptureEvent::Frame {
+                        thumbnail_png_base64: create_thumbnail(&cropped),
+                        width: cropped.width(),
+                        height: cropped.height(),
+                        ms: start.elapsed().as_millis() as u64,
+                        skipped,
+                    },
+                );
+                skipped = 0;
+                last_emit = Instant::now();
+            } else {
+                skipped += 1;
             }
         }
 
-        let mut state = state_arc_clone.lock().unwrap();
+        let mut state = state_arc_clone.lock().unwrap_or_else(|e| e.into_inner());
         state.backend.stop_stream();
     });
 
     {
-        let mut state = state_arc.lock().unwrap();
+        let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
         state.capture_thread = Some(handle);
     }
     Ok(())
@@ -442,12 +531,12 @@ async fn live_stop() -> Result<(), String> {
 
     let state_arc = get_capture_state();
     {
-        let mut state = state_arc.lock().unwrap();
+        let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
         state.backend.stop_stream();
     }
 
     let handle = {
-        let mut state = state_arc.lock().unwrap();
+        let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
         state.capture_thread.take()
     };
 
@@ -461,7 +550,7 @@ async fn live_stop() -> Result<(), String> {
 #[tauri::command]
 async fn save_last_capture(_app: AppHandle) -> Result<String, String> {
     let state_arc = get_capture_state();
-    let state = state_arc.lock().unwrap();
+    let state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let dir = dirs::picture_dir()
         .ok_or("No Pictures directory")?
@@ -471,9 +560,9 @@ async fn save_last_capture(_app: AppHandle) -> Result<String, String> {
 
     let mut saved = Vec::new();
 
-    if let Some(full) = &state.last_full_frame {
-        let path = dir.join(format!("full-{}.png", timestamp));
-        full.save(&path).map_err(|e| e.to_string())?;
+    for full in &state.last_frames {
+        let path = dir.join(format!("full-{}-{}.png", timestamp, full.index));
+        full.image.save(&path).map_err(|e| e.to_string())?;
         saved.push(path.to_string_lossy().to_string());
     }
 
@@ -545,10 +634,12 @@ pub fn run() {
             // Initialize capture state with app handle
             let state_arc = get_capture_state();
             {
-                let mut state = state_arc.lock().unwrap();
+                let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
                 state.backend = create_capture_backend("frame".to_string(), app.handle());
+                WAYLAND_BACKEND.store(state.backend.is_wayland(), Ordering::SeqCst);
                 eprintln!("[lenslate] capture backend wayland={}", state.backend.is_wayland());
             }
+            translate_service::init(app.handle());
 
             Ok(())
         })
@@ -559,9 +650,17 @@ pub fn run() {
             capture_once,
             ocr_once,
             set_ocr_script,
+            set_overlay_boxes,
+            capture_reselect,
+            capture_backend,
             live_start,
             live_stop,
-            save_last_capture
+            save_last_capture,
+            translate_service::get_settings,
+            translate_service::update_settings,
+            translate_service::set_api_key,
+            translate_service::delete_api_key,
+            translate_service::api_key_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running LensLate");
