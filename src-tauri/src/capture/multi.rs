@@ -7,6 +7,7 @@
 //!   into that monitor's captured image.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
@@ -92,6 +93,11 @@ impl LiveLocator {
         self.frames.get(&index)
     }
 
+    /// The latest picture of every monitor seen so far.
+    pub fn frames(&self) -> impl Iterator<Item = &MonitorFrame> {
+        self.frames.values()
+    }
+
     #[cfg(test)]
     pub fn last(&self) -> Option<&Located> {
         self.last.as_ref()
@@ -158,6 +164,42 @@ impl LiveLocator {
         self.last = Some(located.clone());
         Observation::Found(located)
     }
+}
+
+/// `LENSLATE_DEBUG_CAPTURE=1` saves the pictures searched when the frame is
+/// not found (see [`save_debug_frames`]).
+pub fn debug_capture_enabled() -> bool {
+    std::env::var("LENSLATE_DEBUG_CAPTURE").is_ok_and(|v| v.trim() == "1")
+}
+
+/// `/tmp/lenslate-debug` on Linux and macOS, `%TEMP%\lenslate-debug` on Windows.
+pub fn debug_dir() -> PathBuf {
+    std::env::temp_dir().join("lenslate-debug")
+}
+
+/// Save each picture as `<time>-<index>-<monitor>.png` in `dir`; returns the
+/// files written.
+pub fn save_debug_frames<'a>(
+    frames: impl IntoIterator<Item = &'a MonitorFrame>,
+    dir: &Path,
+) -> std::io::Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(dir)?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S%.3f");
+    let mut saved = Vec::new();
+    for frame in frames {
+        let name: String = frame
+            .name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{stamp}-{}-{name}.png", frame.index));
+        frame
+            .image
+            .save(&path)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        saved.push(path);
+    }
+    Ok(saved)
 }
 
 /// A monitor in some desktop coordinate space.
@@ -426,6 +468,27 @@ mod tests {
             height: h,
             scale,
         }
+    }
+
+    #[test]
+    fn debug_frames_are_saved_as_png() {
+        let dir = std::env::temp_dir().join(format!("lenslate-debug-test-{}", std::process::id()));
+        let frames = [
+            MonitorFrame {
+                index: 0,
+                name: "portal-0@0,0(1920x1080)".into(),
+                image: screen(40, 30, None, 1),
+            },
+            frame(1, screen(20, 10, None, 1)),
+        ];
+        let saved = save_debug_frames(&frames, &dir).unwrap();
+        assert_eq!(saved.len(), 2);
+        let first = saved[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(first.ends_with("-0-portal_0_0_0_1920x1080_.png"), "{first}");
+        let back = image::open(&saved[1]).unwrap().to_rgba8();
+        assert_eq!(back.dimensions(), (20, 10));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(debug_dir().ends_with("lenslate-debug"));
     }
 
     #[test]

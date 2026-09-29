@@ -2,6 +2,12 @@ use crate::capture::{Rect, INSET_PX, MARKER_BORDER_PX, MARKER_RGB};
 use image::{Rgba, RgbaImage};
 
 const COLOR_TOLERANCE: u8 = 12;
+/// Gaps (in pixels) bridged when following a border edge.
+const MAX_GAP: i32 = 3;
+/// A border is accepted when this share of its pixels (per mille) match,
+/// and each side on its own reaches `MIN_SIDE_PERMILLE`.
+const MIN_BORDER_PERMILLE: usize = 950;
+const MIN_SIDE_PERMILLE: usize = 900;
 
 fn color_match(pixel: Rgba<u8>, target: Rgba<u8>) -> bool {
     let dr = pixel[0].abs_diff(target[0]);
@@ -10,59 +16,98 @@ fn color_match(pixel: Rgba<u8>, target: Rgba<u8>) -> bool {
     dr <= COLOR_TOLERANCE && dg <= COLOR_TOLERANCE && db <= COLOR_TOLERANCE
 }
 
+/// The marker colour, allowing dimming (a nearby shadow) and slight
+/// antialiasing: compared by hue and saturation instead of exact RGB.
+/// #19E6C1 has hue ~169° and saturation ~0.89; accepted are hues 165–173°,
+/// saturation >= 0.6 and brightness >= ~40%.
+fn is_marker_px(p: Rgba<u8>) -> bool {
+    if color_match(p, MARKER_RGB) {
+        return true;
+    }
+    let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
+    if g < 100 || g <= b || b <= r {
+        return false;
+    }
+    let chroma = g - r;
+    if chroma * 10 < g * 6 {
+        return false;
+    }
+    let t = (b - r) * 100;
+    t >= 75 * chroma && t <= 89 * chroma
+}
+
 fn is_marker_border(img: &RgbaImage, x: i32, y: i32) -> bool {
     if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
         return false;
     }
-    color_match(*img.get_pixel(x as u32, y as u32), MARKER_RGB)
+    is_marker_px(*img.get_pixel(x as u32, y as u32))
 }
 
+/// Whether `rect` has a marker border: enough of its pixels match overall
+/// and on every side (tolerates a few dimmed or covered pixels).
 fn check_border_at(img: &RgbaImage, rect: Rect) -> bool {
-    let w = rect.w as i32;
-    let h = rect.h as i32;
-    let x = rect.x;
-    let y = rect.y;
-
-    if x + w > img.width() as i32 || y + h > img.height() as i32 {
+    let (x, y, w, h) = (rect.x, rect.y, rect.w as i32, rect.h as i32);
+    if x < 0 || y < 0 || x + w > img.width() as i32 || y + h > img.height() as i32 {
         return false;
     }
-
     let border = MARKER_BORDER_PX as i32;
-
-    // Check top and bottom borders
-    for i in 0..w {
-        for b in 0..border {
-            if !is_marker_border(img, x + i, y + b) {
-                return false;
-            }
-            if !is_marker_border(img, x + i, y + h - 1 - b) {
-                return false;
+    let count = |xs: std::ops::Range<i32>, ys: std::ops::Range<i32>| {
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for yy in ys {
+            for xx in xs.clone() {
+                total += 1;
+                hits += usize::from(is_marker_border(img, xx, yy));
             }
         }
-    }
-
-    // Check left and right borders
-    for j in 0..h {
-        for b in 0..border {
-            if !is_marker_border(img, x + b, y + j) {
-                return false;
-            }
-            if !is_marker_border(img, x + w - 1 - b, y + j) {
-                return false;
-            }
+        (hits, total)
+    };
+    let sides = [
+        count(x..x + w, y..y + border),
+        count(x..x + w, y + h - border..y + h),
+        count(x..x + border, y..y + h),
+        count(x + w - border..x + w, y..y + h),
+    ];
+    let (mut hits, mut total) = (0, 0);
+    for (side_hits, side_total) in sides {
+        if side_total == 0 || side_hits * 1000 < side_total * MIN_SIDE_PERMILLE {
+            return false;
         }
+        hits += side_hits;
+        total += side_total;
     }
-
-    true
+    hits * 1000 >= total * MIN_BORDER_PERMILLE
 }
 
-/// Number of consecutive marker pixels starting at (x, y) in direction (dx, dy).
+/// Length of the marker line starting at (x, y) in direction (dx, dy).
+/// Gaps of up to `MAX_GAP` pixels are bridged when at least `MIN_RESUME`
+/// marker pixels follow, so stray marker-coloured pixels next to the frame
+/// never stretch it.
 fn run_len(img: &RgbaImage, x: i32, y: i32, dx: i32, dy: i32) -> i32 {
+    const MIN_RESUME: i32 = 4;
+    let hit = |n: i32| is_marker_border(img, x + dx * n, y + dy * n);
     let mut n = 0;
-    while is_marker_border(img, x + dx * n, y + dy * n) {
+    while hit(n) {
         n += 1;
     }
-    n
+    let mut end = n;
+    loop {
+        let gap_start = n;
+        while !hit(n) && n - gap_start <= MAX_GAP {
+            n += 1;
+        }
+        if n - gap_start > MAX_GAP {
+            return end;
+        }
+        let run_start = n;
+        while hit(n) {
+            n += 1;
+        }
+        if n - run_start < MIN_RESUME {
+            return end;
+        }
+        end = n;
+    }
 }
 
 fn search_region(img: &RgbaImage, region: Rect, min_dim: i32) -> Option<Rect> {
@@ -310,6 +355,180 @@ mod tests {
             result.is_none(),
             "Thin line should not be detected as frame"
         );
+    }
+
+    /// Plain light page with the frame's border drawn in `color` on the
+    /// given side rows/columns, and exact marker elsewhere.
+    fn page_with_frame(r: Rect) -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(400, 300, Rgba([236, 238, 240, 255]));
+        for y in r.y..r.y + r.h as i32 {
+            for x in r.x..r.x + r.w as i32 {
+                let edge = x < r.x + 2
+                    || y < r.y + 2
+                    || x >= r.x + r.w as i32 - 2
+                    || y >= r.y + r.h as i32 - 2;
+                if edge {
+                    img.put_pixel(x as u32, y as u32, MARKER_RGB);
+                }
+            }
+        }
+        img
+    }
+
+    const FRAME: Rect = Rect {
+        x: 40,
+        y: 50,
+        w: 300,
+        h: 120,
+    };
+
+    #[test]
+    fn test_marker_pixel_classifier() {
+        assert!(is_marker_px(MARKER_RGB));
+        // Dimmed by a shadow (measured on GNOME Wayland).
+        assert!(is_marker_px(Rgba([22, 206, 173, 255])));
+        assert!(is_marker_px(Rgba([22, 203, 170, 255])));
+        // Marker blended 25% with a white page.
+        assert!(is_marker_px(Rgba([82, 236, 209, 255])));
+        // Other greens and teals are not the marker.
+        for other in [
+            [0, 150, 136], // Material teal
+            [0, 200, 0],
+            [0, 128, 128],
+            [64, 224, 208], // turquoise
+            [120, 200, 180],
+            [10, 60, 50], // too dark
+            [255, 255, 255],
+        ] {
+            let p = Rgba([other[0], other[1], other[2], 255]);
+            assert!(!is_marker_px(p), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn test_bottom_border_darkened_by_shadow() {
+        let mut img = page_with_frame(FRAME);
+        // A panel shadow below the frame darkens its bottom border rows and
+        // the page under it.
+        let bottom = FRAME.y + FRAME.h as i32;
+        for x in FRAME.x..FRAME.x + FRAME.w as i32 {
+            img.put_pixel(x as u32, (bottom - 2) as u32, Rgba([22, 206, 173, 255]));
+            img.put_pixel(x as u32, (bottom - 1) as u32, Rgba([22, 203, 170, 255]));
+            for (i, y) in (bottom..bottom + 20).enumerate() {
+                let v = 150 + i as u8 * 4;
+                img.put_pixel(x as u32, y as u32, Rgba([v, v, v, 255]));
+            }
+        }
+        assert_eq!(locate_frame(&img, None), Some(FRAME));
+        assert_eq!(locate_frame(&img, Some(FRAME)), Some(FRAME));
+    }
+
+    #[test]
+    fn test_toolbar_with_1px_gap_and_small_notch() {
+        let mut img = page_with_frame(FRAME);
+        // Toolbar tab above the right end of the top border, 1px of page
+        // between them.
+        let surface = Rgba([30, 35, 34, 255]);
+        for y in FRAME.y - 29..FRAME.y - 1 {
+            for x in FRAME.x + 150..FRAME.x + FRAME.w as i32 {
+                img.put_pixel(x as u32, y as u32, surface);
+            }
+        }
+        assert_eq!(locate_frame(&img, None), Some(FRAME));
+        // Its bottom edge antialiased onto 3 pixels of the outer border row.
+        for x in FRAME.x + 200..FRAME.x + 203 {
+            img.put_pixel(x as u32, FRAME.y as u32, Rgba([60, 90, 85, 255]));
+        }
+        assert_eq!(locate_frame(&img, None), Some(FRAME));
+    }
+
+    #[test]
+    fn test_fractional_dpi_antialiased_border() {
+        // 2px CSS at 1.25x = 2.5 device pixels: the outer ring is a blend of
+        // marker and page, then two solid rings, then a blend with the
+        // (transparent) inside showing the page.
+        let page = [236u8, 238, 240];
+        let blend = |a: [u8; 3], t: f32| {
+            let mix = |c: usize| (MARKER_RGB[c] as f32 * t + a[c] as f32 * (1.0 - t)) as u8;
+            Rgba([mix(0), mix(1), mix(2), 255])
+        };
+        let outer = Rect {
+            x: 60,
+            y: 40,
+            w: 250,
+            h: 150,
+        };
+        let mut img = RgbaImage::from_pixel(400, 300, Rgba([page[0], page[1], page[2], 255]));
+        let ring = |img: &mut RgbaImage, i: i32, px: Rgba<u8>| {
+            let (x0, y0) = (outer.x + i, outer.y + i);
+            let (x1, y1) = (
+                outer.x + outer.w as i32 - 1 - i,
+                outer.y + outer.h as i32 - 1 - i,
+            );
+            for x in x0..=x1 {
+                img.put_pixel(x as u32, y0 as u32, px);
+                img.put_pixel(x as u32, y1 as u32, px);
+            }
+            for y in y0..=y1 {
+                img.put_pixel(x0 as u32, y as u32, px);
+                img.put_pixel(x1 as u32, y as u32, px);
+            }
+        };
+        ring(&mut img, 0, blend(page, 0.5));
+        ring(&mut img, 1, MARKER_RGB);
+        ring(&mut img, 2, MARKER_RGB);
+        ring(&mut img, 3, blend(page, 0.5));
+        let found = locate_frame(&img, None).expect("antialiased frame");
+        assert!((found.x - outer.x).abs() <= 1 && (found.y - outer.y).abs() <= 1);
+        assert!(found.w.abs_diff(outer.w) <= 2 && found.h.abs_diff(outer.h) <= 2);
+        // The crop is inside the border and never contains marker pixels.
+        let crop = crop_inside(&img, found, INSET_PX);
+        assert!(crop.pixels().all(|p| !is_marker_px(*p)));
+    }
+
+    #[test]
+    fn test_teal_ui_rectangles_are_not_the_frame() {
+        let mut img = RgbaImage::from_pixel(300, 200, Rgba([250, 250, 250, 255]));
+        for (i, color) in [[0u8, 150, 136], [64, 224, 208], [0, 200, 0]]
+            .iter()
+            .enumerate()
+        {
+            let r = Rect {
+                x: 10 + i as i32 * 90,
+                y: 20,
+                w: 80,
+                h: 60,
+            };
+            for y in r.y..r.y + r.h as i32 {
+                for x in r.x..r.x + r.w as i32 {
+                    let edge = x < r.x + 2
+                        || y < r.y + 2
+                        || x >= r.x + r.w as i32 - 2
+                        || y >= r.y + r.h as i32 - 2;
+                    if edge {
+                        img.put_pixel(
+                            x as u32,
+                            y as u32,
+                            Rgba([color[0], color[1], color[2], 255]),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(locate_frame(&img, None), None);
+    }
+
+    #[test]
+    fn test_border_with_a_missing_side_is_rejected() {
+        let mut img = page_with_frame(FRAME);
+        // Right side covered by another window over 30% of its height.
+        let right = FRAME.x + FRAME.w as i32 - 2;
+        for y in FRAME.y + 20..FRAME.y + 60 {
+            for x in right..right + 2 {
+                img.put_pixel(x as u32, y as u32, Rgba([20, 20, 20, 255]));
+            }
+        }
+        assert_eq!(locate_frame(&img, None), None);
     }
 
     #[test]

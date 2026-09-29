@@ -27,6 +27,9 @@ use capture::{
 };
 
 static FRAME_VISIBLE: AtomicBool = AtomicBool::new(false);
+/// Set once at startup; read without taking the capture lock, which the
+/// portal dialog may hold for a while.
+static WAYLAND_BACKEND: AtomicBool = AtomicBool::new(false);
 static LIVE_CAPTURE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn toggle_frame(app: &AppHandle) {
@@ -121,7 +124,15 @@ fn is_wayland_session() -> bool {
 fn create_capture_backend(window_label: String, app: &AppHandle) -> Box<dyn ScreenCapture> {
     #[cfg(target_os = "linux")]
     if is_wayland_session() {
-        return Box::new(WaylandCapture::new());
+        let app = app.clone();
+        return Box::new(
+            WaylandCapture::new().with_portal_status(Box::new(move |waiting| {
+                let _ = app.emit(
+                    "capture://portal",
+                    serde_json::json!({ "waiting": waiting }),
+                );
+            })),
+        );
     }
     let mut backend = XCapCapture::new(window_label);
     backend.set_app_handle(app.clone());
@@ -207,6 +218,17 @@ fn missing_shared_monitors(app: &AppHandle, backend: &dyn ScreenCapture) -> bool
         .is_some_and(|shared| shared < monitor_count(app))
 }
 
+/// With `LENSLATE_DEBUG_CAPTURE=1`, save the searched pictures.
+fn dump_debug_frames<'a>(frames: impl IntoIterator<Item = &'a MonitorFrame>) {
+    if !capture::multi::debug_capture_enabled() {
+        return;
+    }
+    match capture::multi::save_debug_frames(frames, &capture::multi::debug_dir()) {
+        Ok(paths) => eprintln!("[lenslate] capture debug saved {paths:?}"),
+        Err(e) => eprintln!("[lenslate] capture debug save failed: {e}"),
+    }
+}
+
 fn log_located(located: &Located, extra: &str) {
     let r = located.rect;
     eprintln!(
@@ -238,6 +260,7 @@ fn capture_crop(state: &mut CaptureState) -> Result<(image::RgbaImage, Located),
     let Some(located) = located else {
         let names: Vec<String> = state.last_frames.iter().map(|f| format!("{f:?}")).collect();
         eprintln!("[lenslate] capture found=no searched={names:?}");
+        dump_debug_frames(&state.last_frames);
         return Err("Frame not found".into());
     };
     log_located(&located, "");
@@ -262,7 +285,12 @@ fn capture_crop_reselecting(
         Err(e)
             if e == "Frame not found" && missing_shared_monitors(app, state.backend.as_ref()) =>
         {
-            eprintln!("[lenslate] frame not on the shared monitors; asking again");
+            // Once per 文 press; the second result is final.
+            eprintln!(
+                "[lenslate] frame not on the shared monitors (shared={:?} connected={}); asking again",
+                state.backend.shared_monitors(),
+                monitor_count(app)
+            );
             state.backend.reselect();
             state.last_located = None;
             capture_crop(state)
@@ -351,9 +379,7 @@ async fn capture_reselect() -> Result<(), String> {
 
 #[tauri::command]
 fn capture_backend() -> &'static str {
-    let state_arc = get_capture_state();
-    let state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
-    if state.backend.is_wayland() {
+    if WAYLAND_BACKEND.load(Ordering::SeqCst) {
         "wayland"
     } else {
         "xcap"
@@ -434,6 +460,7 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                             "[lenslate] capture found=no ms={} skipped={skipped} unshared_monitors={unshared}",
                             start.elapsed().as_millis()
                         );
+                        dump_debug_frames(locator.frames());
                         let _ = app_handle.emit(
                             "capture://error",
                             CaptureEvent::Error {
@@ -609,6 +636,7 @@ pub fn run() {
             {
                 let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
                 state.backend = create_capture_backend("frame".to_string(), app.handle());
+                WAYLAND_BACKEND.store(state.backend.is_wayland(), Ordering::SeqCst);
                 eprintln!("[lenslate] capture backend wayland={}", state.backend.is_wayland());
             }
             translate_service::init(app.handle());

@@ -15,7 +15,6 @@
   --muted: #5d6865;
   --line: rgba(28, 33, 32, 0.14);
   --danger: #c62828;
-  --shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
   color: var(--text);
 }
 :root[data-theme="dark"] {
@@ -26,7 +25,6 @@
   --muted: #a3aeab;
   --line: rgba(237, 242, 239, 0.16);
   --danger: #ff6b6b;
-  --shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
 
 * {
@@ -62,12 +60,19 @@ input {
 .frame-shell > * {
   position: absolute;
 }
+/* The marker border is the topmost layer: nothing may cover or tint it
+   (capture/locate.rs finds the frame by this exact colour). */
 .frame-outline {
   border: 2px solid var(--frame-border);
   /* Square corners: capture/locate.rs expects an unbroken rectangular border. */
   border-radius: 0;
   pointer-events: none;
-  z-index: 1;
+  z-index: 20;
+}
+/* While capturing, no effect may bleed onto the border. */
+.frame-shell.capturing * {
+  box-shadow: none !important;
+  filter: none !important;
 }
 .resize-zone {
   z-index: 6;
@@ -172,7 +177,8 @@ input {
   overflow: hidden;
   border: 1px solid var(--line);
   background: var(--surface);
-  box-shadow: var(--shadow);
+  /* No shadow: the panel touches the frame and a blur would darken the
+     marker border next to it. */
   cursor: default;
   z-index: 4;
 }
@@ -229,6 +235,11 @@ input {
 }
 .placeholder {
   color: var(--muted);
+}
+.info-line,
+.toolbar-status.info {
+  color: var(--muted);
+  font-size: 12px;
 }
 .status-line {
   color: var(--danger);

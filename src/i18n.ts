@@ -55,6 +55,7 @@ void i18n.use(initReactI18next).init({
         cached: "cached",
         fellBack: "Tried first: {{failures}}",
         chooseScreens: "Choose screens",
+        waitingPermission: "Waiting for screen-share permission…",
         frameNotFoundHint:
           "Frame not found on the shared screens. Choose the screen that shows the frame.",
         tabDisplay: "Display",
@@ -133,6 +134,7 @@ void i18n.use(initReactI18next).init({
         cached: "من الذاكرة",
         fellBack: "جُرّب أولًا: {{failures}}",
         chooseScreens: "اختيار الشاشات",
+        waitingPermission: "بانتظار إذن مشاركة الشاشة…",
         frameNotFoundHint:
           "لم يُعثر على الإطار في الشاشات المشارَكة. اختر الشاشة التي يظهر فيها الإطار.",
         tabDisplay: "العرض",

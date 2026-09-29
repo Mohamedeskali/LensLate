@@ -18,12 +18,16 @@ use std::io::Cursor;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const RESTORE_TOKEN_FILE: &str = "lenslate-restore-token";
 const CAPTURE_ONCE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait for the screen-share dialog (and the streams behind it).
+pub const PORTAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// After the first monitor answered a one-shot capture, how long to wait for
 /// the others (idle monitors may not send a picture at all).
 const OTHER_MONITORS_GRACE: Duration = Duration::from_millis(300);
@@ -122,8 +126,12 @@ struct Worker {
     monitors: usize,
 }
 
+/// Told `true` while the screen-share dialog may be open, `false` after.
+pub type PortalStatus = Box<dyn Fn(bool) + Send>;
+
 pub struct WaylandCapture {
     worker: Option<Worker>,
+    on_portal: Option<PortalStatus>,
     /// Latest one-shot picture of each shared monitor, used for monitors that
     /// stay idle (send no new picture) during a one-shot capture.
     last_frames: Vec<Option<MonitorFrame>>,
@@ -133,15 +141,30 @@ impl WaylandCapture {
     pub fn new() -> Self {
         Self {
             worker: None,
+            on_portal: None,
             last_frames: Vec::new(),
         }
+    }
+
+    pub fn with_portal_status(mut self, on_portal: PortalStatus) -> Self {
+        self.on_portal = Some(on_portal);
+        self
     }
 
     fn send(&mut self, cmd: WorkerCommand) -> CaptureResult<()> {
         // Respawn if the stream ended (e.g. the user stopped sharing).
         let worker = match self.worker.take() {
             Some(worker) if !worker.handle.is_finished() => worker,
-            _ => spawn_worker()?,
+            _ => {
+                if let Some(status) = &self.on_portal {
+                    status(true);
+                }
+                let spawned = spawn_worker(PORTAL_TIMEOUT);
+                if let Some(status) = &self.on_portal {
+                    status(false);
+                }
+                spawned?
+            }
         };
         let result = worker
             .tx
@@ -152,19 +175,32 @@ impl WaylandCapture {
     }
 }
 
-fn spawn_worker() -> CaptureResult<Worker> {
+/// Start the worker thread (portal dialog, then PipeWire streams). Gives up
+/// after `timeout`; an abandoned worker closes its session and exits as soon
+/// as the portal answers.
+fn spawn_worker(timeout: Duration) -> CaptureResult<Worker> {
     let (tx, rx) = pw::channel::channel::<WorkerCommand>();
     let (ready_tx, ready_rx) = mpsc::channel::<CaptureResult<usize>>();
+    let abandoned = Arc::new(AtomicBool::new(false));
 
+    let worker_abandoned = abandoned.clone();
     let handle = thread::Builder::new()
         .name("lenslate-pipewire".into())
         .spawn(move || {
-            if let Err(e) = run_worker(rx, &ready_tx) {
+            if let Err(e) = run_worker(rx, &ready_tx, timeout, &worker_abandoned) {
                 let _ = ready_tx.send(Err(e));
             }
         })?;
 
-    match ready_rx.recv() {
+    // A little longer than the worker's own portal timeout, so its error wins.
+    match ready_rx.recv_timeout(timeout + Duration::from_secs(5)) {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            eprintln!("[lenslate] capture: screen-share permission timed out");
+            Err(CaptureError::Portal(
+                "Timed out waiting for screen-share permission".into(),
+            ))
+        }
         Ok(Ok(monitors)) => Ok(Worker {
             tx,
             handle,
@@ -174,19 +210,31 @@ fn spawn_worker() -> CaptureResult<Worker> {
             let _ = handle.join();
             Err(e)
         }
-        Err(_) => Err(CaptureError::PipeWire("Worker thread died".into())),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(CaptureError::PipeWire("Worker thread died".into()))
+        }
     }
 }
 
 fn run_worker(
     rx: pw::channel::Receiver<WorkerCommand>,
     ready_tx: &Sender<CaptureResult<usize>>,
+    timeout: Duration,
+    abandoned: &AtomicBool,
 ) -> CaptureResult<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
 
-    let (screencast, session, monitors, fd) = rt.block_on(open_portal())?;
+    let (screencast, session, monitors, fd) = rt
+        .block_on(async { tokio::time::timeout(timeout, open_portal()).await })
+        .map_err(|_| {
+            CaptureError::Portal("Timed out waiting for screen-share permission".into())
+        })??;
+    if abandoned.load(Ordering::SeqCst) {
+        let _ = rt.block_on(session.close());
+        return Ok(());
+    }
     let result = run_pipewire(fd, &monitors, rx, ready_tx);
 
     let _ = rt.block_on(session.close());

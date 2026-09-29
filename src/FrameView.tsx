@@ -142,6 +142,7 @@ export default function FrameView() {
   const [translateError, setTranslateError] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [waitingPermission, setWaitingPermission] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
   const [script, setScript] = useState<OcrScript>("auto");
   const [models, setModels] = useState<ModelsEvent | null>(null);
@@ -383,6 +384,10 @@ export default function FrameView() {
         setErrorMsg(t("captureError", { message: payload.message }));
       }),
       listen("capture://stopped", () => setLive(false)),
+      // The screen-share dialog is open (Wayland portal).
+      listen<{ waiting: boolean }>("capture://portal", ({ payload }) =>
+        setWaitingPermission(payload.waiting),
+      ),
       listen<OcrResult>("ocr://result", ({ payload }) => {
         setErrorMsg(null);
         setFrameNotFound(false);
@@ -471,10 +476,11 @@ export default function FrameView() {
     setErrorMsg(null);
     setFrameNotFound(false);
     setReading(true);
-    // Take our own drawing off the captured area first.
+    // Take our own drawing (overlay, inside panel, shadows) off the screen
+    // first, in every mode, so the marker border is captured untouched.
+    setCapturing(true);
+    await nextPaint();
     if (reportedRef.current !== "[]") {
-      setCapturing(true);
-      await nextPaint();
       reportedRef.current = "[]";
       await invoke("set_overlay_boxes", { boxes: [] });
     }
@@ -487,6 +493,7 @@ export default function FrameView() {
     } finally {
       setCapturing(false);
       setReading(false);
+      setWaitingPermission(false);
     }
   }, [t, acceptOcr]);
 
@@ -702,7 +709,10 @@ export default function FrameView() {
           </button>
         </div>
       )}
-      {!ocr && !status && (
+      {waitingPermission && (
+        <div className="info-line">{t("waitingPermission")}</div>
+      )}
+      {!ocr && !status && !waitingPermission && (
         <span className="placeholder">
           {reading ? t("reading") : t("translationPlaceholder")}
         </span>
@@ -774,7 +784,7 @@ export default function FrameView() {
 
   return (
     <main
-      className={`frame-shell mode-${mode} placement-${placement}`}
+      className={`frame-shell mode-${mode} placement-${placement}${capturing ? " capturing" : ""}`}
       style={{ fontFamily: FONT_STACK }}
       onMouseDown={(event) => {
         const el = event.target as HTMLElement;
@@ -816,9 +826,12 @@ export default function FrameView() {
         style={boxStyle(layout.toolbar)}
         aria-label={t("toolbar")}
       >
-        {!layout.panel && !layout.side && status && (
-          <span className="toolbar-status" title={status}>
-            {status}
+        {!layout.panel && !layout.side && (waitingPermission || status) && (
+          <span
+            className={`toolbar-status${waitingPermission ? " info" : ""}`}
+            title={waitingPermission ? t("waitingPermission") : (status ?? "")}
+          >
+            {waitingPermission ? t("waitingPermission") : status}
           </span>
         )}
         {!layout.panel &&
@@ -964,7 +977,7 @@ export default function FrameView() {
 
       {layout.panel && (
         <section
-          className={`result-panel${capturing ? " hidden" : ""}`}
+          className={`result-panel${capturing && placement === "inside" ? " hidden" : ""}`}
           style={boxStyle(layout.panel)}
         >
           {resultBody}
@@ -974,7 +987,7 @@ export default function FrameView() {
 
       {layout.side && (
         <aside
-          className={`side-bubble${capturing ? " hidden" : ""}`}
+          className={`side-bubble${capturing && placement === "inside" ? " hidden" : ""}`}
           style={boxStyle(layout.side)}
         >
           {resultBody}
