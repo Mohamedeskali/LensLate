@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use tauri::{AppHandle, Emitter};
 
 use crate::ocr::{OcrResultData, Script};
-use crate::settings::{self, Settings};
+use crate::settings::{self, DisplayMode, Settings};
 use crate::translate::cache::TranslationCache;
 use crate::translate::chain::FallbackChain;
 use crate::translate::keys::{self, KeyringStore, SecretStore};
@@ -112,6 +112,11 @@ impl Service {
         *self.chain.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(chain);
     }
 
+    /// "Original only" shows no translation, so none is requested.
+    fn translating(&self) -> bool {
+        self.settings().display_mode != DisplayMode::Original
+    }
+
     fn job(&self, ocr: &OcrResultData) -> Job {
         // The Arabic OCR model only reads Arabic, so the source is known.
         let from = (ocr.script == Script::Arabic).then(|| Lang::new("ar"));
@@ -125,14 +130,14 @@ impl Service {
 
 /// Translate a live OCR result (debounced, only when the text changed).
 pub fn submit_live(ocr: &OcrResultData) {
-    if let Ok(s) = service() {
+    if let Some(s) = service().ok().filter(|s| s.translating()) {
         s.pipeline.submit_live(s.job(ocr));
     }
 }
 
 /// Translate a one-shot OCR result right away.
 pub fn submit_now(ocr: &OcrResultData) {
-    if let Ok(s) = service() {
+    if let Some(s) = service().ok().filter(|s| s.translating()) {
         s.pipeline.submit_now(s.job(ocr));
     }
 }
@@ -152,7 +157,8 @@ pub fn update_settings(settings: Settings) -> Result<Settings, String> {
     if old.engines != settings.engines {
         s.rebuild_chain();
     }
-    if old.engines != settings.engines || old.target_lang != settings.target_lang {
+    let resumed = old.display_mode == DisplayMode::Original && s.translating();
+    if old.engines != settings.engines || old.target_lang != settings.target_lang || resumed {
         s.pipeline.refresh(Lang::new(&settings.target_lang));
     }
     Ok(settings)

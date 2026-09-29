@@ -1,8 +1,8 @@
 //! End-to-end OCR accuracy on the rendered fixtures in `tests/fixtures/`.
 //!
 //! Each `<name>.png` with a `<name>.txt` next to it is recognized and scored
-//! by character accuracy (`1 - edit distance / expected length`). English and
-//! French fixtures must reach 95%; Arabic is reported.
+//! by character accuracy (`1 - edit distance / expected length`). Latin-script
+//! fixtures must reach 95%, Arabic 90%.
 //!
 //! Models are downloaded into the app data dir on first run. Set
 //! `LENSLATE_MODELS_DIR` to load them from another directory (no download).
@@ -15,16 +15,17 @@ use lenslate_lib::ocr::engine::PaddleOcrEngine;
 use lenslate_lib::ocr::models::{self, StderrReporter};
 use lenslate_lib::ocr::{OcrEngine, Script};
 
-const MIN_ACCURACY: f64 = 0.95;
+const LATIN_MIN: f64 = 0.95;
+const ARABIC_MIN: f64 = 0.90;
 
-/// (fixture, script, accuracy asserted)
-const FIXTURES: &[(&str, Script, bool)] = &[
-    ("english", Script::Latin, true),
-    ("french", Script::Latin, true),
-    ("light_on_dark", Script::Latin, true),
-    ("small_text", Script::Latin, true),
-    ("mixed", Script::Latin, true),
-    ("arabic", Script::Arabic, false),
+/// (fixture, script, minimum accuracy)
+const FIXTURES: &[(&str, Script, f64)] = &[
+    ("english", Script::Latin, LATIN_MIN),
+    ("french", Script::Latin, LATIN_MIN),
+    ("light_on_dark", Script::Latin, LATIN_MIN),
+    ("small_text", Script::Latin, LATIN_MIN),
+    ("mixed", Script::Latin, LATIN_MIN),
+    ("arabic", Script::Arabic, ARABIC_MIN),
 ];
 
 fn models_dir() -> PathBuf {
@@ -90,7 +91,7 @@ fn fixtures_reach_accuracy() {
     let mut failures = Vec::new();
     println!("| fixture | script | got | accuracy | ms |");
     println!("|---|---|---|---|---|");
-    for &(name, script, asserted) in FIXTURES {
+    for &(name, script, min_accuracy) in FIXTURES {
         let img = image::open(fixtures.join(format!("{name}.png")))
             .unwrap_or_else(|e| panic!("{name}.png: {e}"))
             .to_rgba8();
@@ -110,11 +111,11 @@ fn fixtures_reach_accuracy() {
             got.replace('\n', " / "),
             acc * 100.0
         );
-        if asserted && acc < MIN_ACCURACY {
+        if acc < min_accuracy {
             failures.push(format!(
                 "{name}: {:.1}% < {:.0}%\n  got:      {got:?}\n  expected: {expected:?}",
                 acc * 100.0,
-                MIN_ACCURACY * 100.0
+                min_accuracy * 100.0
             ));
         }
     }

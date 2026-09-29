@@ -39,6 +39,8 @@ fn toggle_frame(app: &AppHandle) {
     } else {
         let _ = frame.show();
         let _ = frame.set_focus();
+        // The frame translates once when it appears (hotkey / tray / --toggle).
+        let _ = app.emit("frame://shown", ());
     }
 }
 

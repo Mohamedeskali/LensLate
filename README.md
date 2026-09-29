@@ -17,4 +17,14 @@ The frame is opened from the tray menu or with `Ctrl+Alt+Y` where global shortcu
 
 On Wayland, the transparent interior is not click-through in this phase. Tauri's cursor-event setting applies to the entire transparent window, so enabling it would also make the border, toolbar, and translation bar unclickable; per-region hit testing requires compositor/native support not available through the current Tauri API. The frame therefore remains interactive as a documented limitation.
 
-Run `pnpm lint`, `pnpm format:check`, `pnpm build`, `cargo fmt --check --manifest-path src-tauri/Cargo.toml`, and `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` for checks.
+## Translation
+
+Recognized text is translated with the engine chosen in the frame toolbar. If it fails or takes more than 5 seconds, the next engine in **Settings > Engines** is tried. Engines: Google (free, no key; the default), Microsoft Translator, Google Cloud Translation, DeepL (free and Pro keys), Claude, OpenAI, Gemini and a local Ollama server. API keys are stored in the system keychain (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows) and never written to files or logs.
+
+The result is shown in one of four display modes (Settings > Display, or the mode button in the toolbar): a panel below the frame, in place over the original lines, a bubble beside the frame, or the original text only.
+
+On Wayland, share every monitor in the screen-sharing dialog (or use **Choose screens** when the frame is not found) so the frame can be found on any of them.
+
+Run `pnpm test` for the frontend unit tests and `cargo test --manifest-path src-tauri/Cargo.toml` for the Rust tests.
+
+Run `pnpm lint`, `pnpm format:check`, `pnpm build`, `cargo fmt --check --manifest-path src-tauri/Cargo.toml`, and `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings` for checks.
