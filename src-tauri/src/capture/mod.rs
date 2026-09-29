@@ -3,6 +3,7 @@ use std::sync::mpsc::Sender;
 use thiserror::Error;
 
 pub mod locate;
+#[cfg(target_os = "linux")]
 pub mod wayland;
 pub mod xcap_backend;
 

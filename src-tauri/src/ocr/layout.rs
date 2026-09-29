@@ -170,6 +170,79 @@ pub fn auto_detect_and_merge(
     (merged, final_script)
 }
 
+/// Join detected boxes that sit on the same row into one line.
+///
+/// Two boxes share a row when their vertical extents overlap by at least half
+/// of the shorter one. Within a row the text runs in reading order (left to
+/// right, or right to left for RTL rows) separated by single spaces; rows are
+/// returned top to bottom. The line confidence is the mean over characters.
+pub fn join_rows(mut boxes: Vec<OcrLine>) -> Vec<OcrLine> {
+    boxes.retain(|b| !b.text.trim().is_empty());
+    boxes.sort_by(|a, b| a.rect.center_y().total_cmp(&b.rect.center_y()));
+    let mut rows: Vec<Vec<OcrLine>> = Vec::new();
+    for b in boxes {
+        let top = b.rect.y;
+        let bottom = b.rect.y + b.rect.h as i32;
+        let row = rows.iter_mut().find(|row| {
+            row.iter().any(|o| {
+                let overlap = bottom.min(o.rect.y + o.rect.h as i32) - top.max(o.rect.y);
+                overlap as f32 >= 0.5 * b.rect.h.min(o.rect.h) as f32
+            })
+        });
+        match row {
+            Some(row) => row.push(b),
+            None => rows.push(vec![b]),
+        }
+    }
+    let mut lines: Vec<OcrLine> = rows
+        .into_iter()
+        .map(|mut row| {
+            let rtl = row.iter().filter(|b| b.rtl).count() * 2 > row.len();
+            if rtl {
+                row.sort_by_key(|b| -(b.rect.x + b.rect.w as i32));
+            } else {
+                row.sort_by_key(|b| b.rect.x);
+            }
+            let x0 = row.iter().map(|b| b.rect.x).min().unwrap_or(0);
+            let y0 = row.iter().map(|b| b.rect.y).min().unwrap_or(0);
+            let x1 = row
+                .iter()
+                .map(|b| b.rect.x + b.rect.w as i32)
+                .max()
+                .unwrap_or(0);
+            let y1 = row
+                .iter()
+                .map(|b| b.rect.y + b.rect.h as i32)
+                .max()
+                .unwrap_or(0);
+            let chars: usize = row.iter().map(|b| b.text.chars().count()).sum();
+            let conf = row
+                .iter()
+                .map(|b| b.conf * b.text.chars().count() as f32)
+                .sum::<f32>()
+                / chars.max(1) as f32;
+            let text = row
+                .iter()
+                .map(|b| b.text.trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            OcrLine {
+                text,
+                conf,
+                rect: Rect {
+                    x: x0,
+                    y: y0,
+                    w: (x1 - x0) as u32,
+                    h: (y1 - y0) as u32,
+                },
+                rtl,
+            }
+        })
+        .collect();
+    lines.sort_by_key(|l| l.rect.y);
+    lines
+}
+
 /// Convert Arabic text from visual order to logical order
 /// This is a simplified version - in production use unicode-bidi
 pub fn arabic_visual_to_logical(text: &str) -> String {
@@ -365,5 +438,56 @@ mod tests {
     #[test]
     fn test_clean_text_arabic() {
         assert_eq!(clean_text("مرحبا  العالم", Script::Arabic), "مرحبا العالم");
+    }
+
+    fn line(text: &str, x: i32, y: i32, w: u32, h: u32, rtl: bool) -> OcrLine {
+        OcrLine {
+            text: text.into(),
+            conf: 0.9,
+            rect: Rect { x, y, w, h },
+            rtl,
+        }
+    }
+
+    #[test]
+    fn test_join_rows_latin() {
+        let lines = join_rows(vec![
+            line("World", 80, 12, 60, 20, false),
+            line("Next", 10, 40, 40, 20, false),
+            line("Hello", 10, 10, 60, 20, false),
+            line("  ", 10, 70, 40, 20, false),
+        ]);
+        let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(text, ["Hello World", "Next"]);
+        assert_eq!(
+            lines[0].rect,
+            Rect {
+                x: 10,
+                y: 10,
+                w: 130,
+                h: 22
+            }
+        );
+    }
+
+    #[test]
+    fn test_join_rows_rtl_runs_right_to_left() {
+        let lines = join_rows(vec![
+            line("العالم", 10, 10, 50, 20, true),
+            line("مرحبا", 70, 10, 50, 20, true),
+        ]);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "مرحبا العالم");
+        assert!(lines[0].rtl);
+    }
+
+    #[test]
+    fn test_join_rows_confidence_is_per_char() {
+        let mut a = line("aaa", 0, 0, 30, 10, false);
+        a.conf = 1.0;
+        let mut b = line("b", 40, 0, 10, 10, false);
+        b.conf = 0.6;
+        let lines = join_rows(vec![a, b]);
+        assert!((lines[0].conf - 0.9).abs() < 1e-6);
     }
 }

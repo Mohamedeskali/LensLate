@@ -11,7 +11,9 @@ use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut,
 
 mod capture;
 pub mod ocr;
+mod ocr_service;
 
+#[cfg(target_os = "linux")]
 use capture::wayland::WaylandCapture;
 use capture::xcap_backend::XCapCapture;
 use capture::{
@@ -102,18 +104,19 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn is_wayland_session() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
 }
 
 fn create_capture_backend(window_label: String, app: &AppHandle) -> Box<dyn ScreenCapture> {
+    #[cfg(target_os = "linux")]
     if is_wayland_session() {
-        Box::new(WaylandCapture::new())
-    } else {
-        let mut backend = XCapCapture::new(window_label);
-        backend.set_app_handle(app.clone());
-        Box::new(backend)
+        return Box::new(WaylandCapture::new());
     }
+    let mut backend = XCapCapture::new(window_label);
+    backend.set_app_handle(app.clone());
+    Box::new(backend)
 }
 
 struct CaptureState {
@@ -182,61 +185,91 @@ async fn capture_once() -> Result<CaptureEvent, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Capture the monitor, locate the frame and crop inside its border.
+fn capture_crop(state: &mut CaptureState) -> Result<(image::RgbaImage, Rect), String> {
+    let full_frame = state.backend.capture_monitor().map_err(|e| {
+        let msg = e.to_string();
+        eprintln!("[lenslate] capture error: {}", msg);
+        if msg.contains("Permission") || msg.contains("denied") {
+            "Screen capture permission denied".to_string()
+        } else {
+            msg
+        }
+    })?;
+    let rect = locate_frame(&full_frame, state.last_rect);
+    state.last_full_frame = Some(full_frame);
+    let Some(r) = rect else {
+        return Err("Frame not found".into());
+    };
+    state.last_rect = Some(r);
+    let full_frame = state.last_full_frame.as_ref().expect("stored above");
+    let cropped = crop_inside(full_frame, r, INSET_PX);
+    state.last_cropped = Some(cropped.clone());
+    Ok((cropped, r))
+}
+
 fn capture_once_blocking() -> CaptureEvent {
     let state_arc = get_capture_state();
     let mut state = state_arc.lock().unwrap();
     let start = Instant::now();
 
-    match state.backend.capture_monitor() {
-        Ok(full_frame) => {
-            state.last_full_frame = Some(full_frame.clone());
-            let rect = locate_frame(&full_frame, state.last_rect);
-
-            match rect {
-                Some(r) => {
-                    state.last_rect = Some(r);
-                    let cropped = crop_inside(&full_frame, r, INSET_PX);
-                    state.last_cropped = Some(cropped.clone());
-
-                    let thumbnail = create_thumbnail(&cropped);
-                    let ms = start.elapsed().as_millis() as u64;
-
-                    eprintln!(
-                        "[lenslate] capture found=yes rect={},{},{}x{} ms={} skipped=0",
-                        r.x, r.y, r.w, r.h, ms
-                    );
-
-                    CaptureEvent::Frame {
-                        thumbnail_png_base64: thumbnail,
-                        width: cropped.width(),
-                        height: cropped.height(),
-                        ms,
-                        skipped: 0,
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "[lenslate] capture found=no rect=none ms={} skipped=0",
-                        start.elapsed().as_millis()
-                    );
-                    CaptureEvent::Error {
-                        message: "Frame not found".into(),
-                    }
-                }
+    match capture_crop(&mut state) {
+        Ok((cropped, r)) => {
+            let thumbnail = create_thumbnail(&cropped);
+            let ms = start.elapsed().as_millis() as u64;
+            eprintln!(
+                "[lenslate] capture found=yes rect={},{},{}x{} ms={} skipped=0",
+                r.x, r.y, r.w, r.h, ms
+            );
+            CaptureEvent::Frame {
+                thumbnail_png_base64: thumbnail,
+                width: cropped.width(),
+                height: cropped.height(),
+                ms,
+                skipped: 0,
             }
         }
-        Err(e) => {
-            let msg = e.to_string();
-            eprintln!("[lenslate] capture error: {}", msg);
-            if msg.contains("Permission") || msg.contains("denied") {
-                CaptureEvent::Error {
-                    message: "Screen capture permission denied".into(),
-                }
-            } else {
-                CaptureEvent::Error { message: msg }
-            }
+        Err(message) => {
+            eprintln!(
+                "[lenslate] capture found=no ms={} skipped=0 ({message})",
+                start.elapsed().as_millis()
+            );
+            CaptureEvent::Error { message }
         }
     }
+}
+
+/// 文: capture once, crop inside the frame and recognize the text.
+#[tauri::command]
+async fn ocr_once(app: AppHandle) -> Result<ocr::OcrResultData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let start = Instant::now();
+        let (cropped, r) = {
+            let state_arc = get_capture_state();
+            let mut state = state_arc.lock().unwrap_or_else(|e| e.into_inner());
+            capture_crop(&mut state)?
+        };
+        eprintln!(
+            "[lenslate] capture found=yes rect={},{},{}x{} ms={} (ocr_once)",
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            start.elapsed().as_millis()
+        );
+        ocr_service::recognize(&app, &cropped, true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Source script for OCR (Auto / Latin / Arabic); live mode re-reads the
+/// current crop with it.
+#[tauri::command]
+fn set_ocr_script(script: ocr::Script) {
+    eprintln!("[lenslate] ocr script={script}");
+    ocr::set_ocr_script(script);
+    ocr_service::invalidate_live();
 }
 
 #[tauri::command]
@@ -298,11 +331,12 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                     consecutive_missing = 0;
                     last_rect = Some(r);
                     let cropped = crop_inside(&full_frame, r, INSET_PX);
-                    let _hash = frame_hash(&cropped);
+                    let hash = frame_hash(&cropped);
+                    ocr_service::offer_live(&app_handle, &cropped, hash);
 
                     let should_emit = {
                         let mut state = state_arc_clone.lock().unwrap();
-                        if state.last_cropped.as_ref().map(frame_hash) == Some(_hash) {
+                        if state.last_cropped.as_ref().map(frame_hash) == Some(hash) {
                             skipped += 1;
                             false
                         } else {
@@ -344,7 +378,8 @@ async fn live_start(app: AppHandle) -> Result<(), String> {
                     if consecutive_missing <= MAX_MISSING_REUSE {
                         if let Some(r) = last_rect {
                             let cropped = crop_inside(&full_frame, r, INSET_PX);
-                            let _hash = frame_hash(&cropped);
+                            let hash = frame_hash(&cropped);
+                            ocr_service::offer_live(&app_handle, &cropped, hash);
 
                             if last_emit.elapsed() >= Duration::from_secs(1) {
                                 let thumbnail = create_thumbnail(&cropped);
@@ -522,6 +557,8 @@ pub fn run() {
             open_settings,
             log_frontend_error,
             capture_once,
+            ocr_once,
+            set_ocr_script,
             live_start,
             live_stop,
             save_last_capture

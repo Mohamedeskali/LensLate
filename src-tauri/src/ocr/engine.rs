@@ -8,27 +8,28 @@
 use crate::ocr::layout;
 use crate::ocr::models::{self};
 use crate::ocr::{OcrEngine, OcrError, OcrLine, OcrResult, OcrResultData, Rect, Script};
-use image::imageops::{crop, FilterType};
+use image::imageops::{crop_imm, FilterType};
 use image::RgbaImage;
 use ndarray::Array4;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// detection parameters (RapidOCR / PaddleOCR defaults)
+// detection parameters (RapidOCR `DBPostProcess` defaults)
 // ---------------------------------------------------------------------------
 
-/// Side of the square detection input. 640 is the RapidOCR default.
+/// Longest side of the detection input; larger crops are scaled down to fit,
+/// smaller ones are letterboxed (zero padding) to a multiple of 32.
 const DET_SIZE: u32 = 640;
 /// Detection input sides are rounded up to a multiple of this (the DB head
 /// downsamples its feature map by 4 and the network needs /8 overall).
 const DET_MULTIPLE: u32 = 32;
-const DET_THRESH: f32 = 0.1;
-const DET_BOX_THRESH: f32 = 0.6;
+const DET_THRESH: f32 = 0.3;
+const DET_BOX_THRESH: f32 = 0.5;
+const DET_UNCLIP_RATIO: f32 = 1.6;
 const DET_MIN_SIZE: f32 = 3.0;
 /// Crops thinner/shorter than this are upscaled before detection.
 const UPSCALE_BELOW: u32 = 20;
@@ -36,8 +37,6 @@ const UPSCALE_BELOW: u32 = 20;
 /// Recognition input height.
 const REC_HEIGHT: usize = 48;
 const REC_MAX_BATCH: usize = 6;
-/// PaddleOCR pads recognition batches with mid grey.
-const REC_PAD: u8 = 127;
 /// Below this mean probability a line is retried with the other recognizer.
 const AUTO_RETRY_CONF: f32 = 0.55;
 
@@ -63,16 +62,20 @@ impl Box2 {
         (self.y1 - self.y0).max(0.0)
     }
 
-    /// PaddleOCR `box_unc`: expand a polygon area in proportion to
-    /// `area * (1 - score) / 3`.
-    fn unclip(self, score: f32) -> Box2 {
-        let area = (self.width() * self.height()).max(1.0);
-        let expand = (area * ((1.0 - score) / 3.0).max(0.0)).sqrt();
+    /// PaddleOCR `unclip`: offset the polygon outwards by
+    /// `area * ratio / perimeter`. For an upright rectangle the bounding box
+    /// of the rounded offset polygon is the rectangle grown by that distance.
+    fn unclip(self, ratio: f32) -> Box2 {
+        let perimeter = 2.0 * (self.width() + self.height());
+        if perimeter <= 0.0 {
+            return self;
+        }
+        let d = self.width() * self.height() * ratio / perimeter;
         Box2 {
-            x0: self.x0 - expand,
-            y0: self.y0 - expand,
-            x1: self.x1 + expand,
-            y1: self.y1 + expand,
+            x0: self.x0 - d,
+            y0: self.y0 - d,
+            x1: self.x1 + d,
+            y1: self.y1 + d,
         }
     }
 
@@ -94,267 +97,100 @@ impl Box2 {
 // DB post-processing
 // ---------------------------------------------------------------------------
 
-/// Where a detected character cluster starts and ends vertically, in
-/// probability-map rows.
-#[derive(Clone, Copy)]
-struct CharCluster {
-    /// column span in the probability map
-    cx0: f32,
-    cx1: f32,
-    /// first and last row of the connected component
-    comp_top: f32,
-    comp_bottom: f32,
-    /// vertical extent chosen from the `above` / `below` profiles
-    top: f32,
-    bottom: f32,
-    score: f32,
-}
-
-impl CharCluster {
-    fn height(&self) -> f32 {
-        (self.bottom - self.top).max(1.0)
-    }
-}
-
-/// A probability-map column is "text" when its mean probability reaches
-/// `box_thresh` (PaddleOCR `filter_tag_det_ss`).
-fn column_is_char(prob: &Array4<f32>, x: usize, box_thresh: f32) -> bool {
-    let mut sum = 0f32;
-    let mut n = 0f32;
-    for y in 0..prob.shape()[2] {
-        let p = prob[[0, 0, y, x]];
-        if p >= DET_THRESH {
-            sum += p;
-            n += 1.0;
-        }
-    }
-    n > 0.0 && sum / n >= box_thresh
-}
-
-/// Extract text boxes from a DB probability map.
+/// Extract text boxes from a DB probability map `[1, 1, H, W]`, following
+/// RapidOCR `DBPostProcess`: binarize at [`DET_THRESH`], dilate 2x2, take each
+/// 8-connected region, score it by the mean probability inside its box, drop
+/// weak or tiny regions and grow the survivors by `area * 1.6 / perimeter`.
 ///
-/// `scale_x` / `scale_y` map probability-map coordinates back to image pixels
-/// and `offset_x` / `offset_y` translate them (used for letterboxed inputs).
+/// Boxes are axis aligned (screen text is horizontal), in map pixels
+/// multiplied by `scale_x` / `scale_y` and clipped to `(dest_w, dest_h)`.
 pub fn boxes_from_probability(
     prob: &Array4<f32>,
     scale_x: f32,
     scale_y: f32,
-    offset_x: f32,
-    offset_y: f32,
-    min_size: f32,
+    dest_w: u32,
+    dest_h: u32,
 ) -> Vec<Box2> {
     let (h, w) = (prob.shape()[2], prob.shape()[3]);
     let at = |y: usize, x: usize| prob[[0, 0, y, x]];
 
-    // -- 1. connected components over prob >= DET_THRESH (4-neighbour).
-    let mut labels = vec![0u32; h * w];
-    let mut components: Vec<Vec<usize>> = Vec::new();
+    // binarize + cv2.dilate with a 2x2 kernel (anchor at 1,1): a pixel is set
+    // when it or its left / upper / upper-left neighbour is above threshold
+    let seg = |y: usize, x: usize| at(y, x) > DET_THRESH;
+    let mut mask = vec![false; h * w];
     for y in 0..h {
         for x in 0..w {
-            if labels[y * w + x] != 0 || at(y, x) < DET_THRESH {
-                continue;
-            }
-            let id = components.len() as u32 + 1;
-            labels[y * w + x] = id;
-            let mut stack = vec![y * w + x];
-            let mut pixels = Vec::new();
-            while let Some(idx) = stack.pop() {
-                pixels.push(idx);
-                let cy = idx / w;
-                let cx = idx % w;
-                for ny in [cy.checked_sub(1), Some(cy + 1).filter(|v| *v < h)] {
-                    let ny = match ny {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    for nx in [cx.checked_sub(1), Some(cx + 1).filter(|v| *v < w)] {
-                        let nx = match nx {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        let nidx = ny * w + nx;
-                        if labels[nidx] == 0 && at(ny, nx) >= DET_THRESH {
-                            labels[nidx] = id;
-                            stack.push(nidx);
-                        }
-                    }
-                }
-            }
-            components.push(pixels);
+            mask[y * w + x] = seg(y, x)
+                || (x > 0 && seg(y, x - 1))
+                || (y > 0 && seg(y - 1, x))
+                || (x > 0 && y > 0 && seg(y - 1, x - 1));
         }
     }
 
+    let mut seen = vec![false; h * w];
     let mut boxes = Vec::new();
-    for pixels in components {
-        let n = pixels.len();
-        if (n as f32).sqrt() < min_size {
+    let mut stack = Vec::new();
+    for start in 0..h * w {
+        if !mask[start] || seen[start] {
             continue;
         }
-
-        // -- 2. row probability profiles used to find the text row band.
-        let mut row_sum = vec![0f32; h];
-        let mut above = vec![0f32; h];
-        let mut below = vec![0f32; h];
-        for &idx in &pixels {
-            let y = idx / w;
-            row_sum[y] += at(y, idx % w);
-        }
-        for y in 0..h {
-            for d in 1..=2 {
-                if y >= d {
-                    above[y - d] += row_sum[y];
-                }
-                if y + d < h {
-                    below[y] += row_sum[y + d];
+        // flood fill one 8-connected region, tracking its extent in pixel
+        // centres (the corners of cv2.minAreaRect for an upright region)
+        seen[start] = true;
+        stack.push(start);
+        let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+        while let Some(idx) = stack.pop() {
+            let (cy, cx) = (idx / w, idx % w);
+            x0 = x0.min(cx);
+            x1 = x1.max(cx);
+            y0 = y0.min(cy);
+            y1 = y1.max(cy);
+            for ny in cy.saturating_sub(1)..=(cy + 1).min(h - 1) {
+                for nx in cx.saturating_sub(1)..=(cx + 1).min(w - 1) {
+                    let n = ny * w + nx;
+                    if mask[n] && !seen[n] {
+                        seen[n] = true;
+                        stack.push(n);
+                    }
                 }
             }
         }
-        let mean_row = (row_sum.iter().filter(|v| **v > 0.0).count() as f32).max(1.0);
-        let rows: Vec<usize> = (0..h).filter(|y| row_sum[*y] > 0.0).collect();
-        let top = rows
-            .iter()
-            .copied()
-            .max_by(|a, b| above[*a].total_cmp(&above[*b]))
-            .unwrap_or(rows[0]);
-        let bottom = rows
-            .iter()
-            .copied()
-            .min_by(|a, b| below[*a].total_cmp(&below[*b]))
-            .unwrap_or(rows[rows.len() - 1]);
-        let top_ratio = above[top] / (2.0 * mean_row);
-        let bottom_ratio = below[bottom] / (2.0 * mean_row);
-        if top_ratio < 0.0 || bottom_ratio < 0.0 {
+        let b = Box2 {
+            x0: x0 as f32,
+            y0: y0 as f32,
+            x1: x1 as f32,
+            y1: y1 as f32,
+        };
+        if b.width().min(b.height()) < DET_MIN_SIZE {
             continue;
         }
-
-        // -- 3. split the component into character columns and space gaps.
-        let is_char: Vec<bool> = (0..w)
-            .map(|x| column_is_char(prob, x, DET_BOX_THRESH))
-            .collect();
-        let mut clusters: Vec<Option<CharCluster>> = Vec::new();
-        let mut x = 0usize;
-        while x < w {
-            if !is_char[x] {
-                x += 1;
-                continue;
+        // box_score_fast: mean probability over the (inclusive) box
+        let mut sum = 0f32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                sum += at(y, x);
             }
-            let x0 = x;
-            let mut x1 = x;
-            while x1 + 1 < w && is_char[x1 + 1] {
-                x1 += 1;
-            }
-            // rows of this column span
-            let cols: Vec<usize> = pixels
-                .iter()
-                .copied()
-                .filter(|idx| idx % w >= x0 && idx % w <= x1)
-                .collect();
-            let mut comp_top = f32::MAX;
-            let mut comp_bottom = f32::MIN;
-            let mut score_sum = 0f32;
-            let mut best = (f32::MIN, top);
-            for &idx in &cols {
-                let cy = idx / w;
-                let p = at(cy, idx % w);
-                score_sum += p;
-                comp_top = comp_top.min(cy as f32);
-                comp_bottom = comp_bottom.max(cy as f32);
-                if above[cy] > best.0 {
-                    best = (above[cy], cy);
-                }
-            }
-            // grow the band up and down while the profile keeps >= 60% of its
-            // value at the anchor row
-            let (b_above, b_below) = (above[best.1], below[best.1]);
-            let mut top = best.1 as f32;
-            while top > 0.0 && above[top as usize - 1] >= b_above * 0.6 {
-                top -= 1.0;
-            }
-            let mut bottom = best.1 as f32;
-            while (bottom as usize) + 1 < h && below[bottom as usize + 1] >= b_below * 0.6 {
-                bottom += 1.0;
-            }
-            let c = CharCluster {
-                cx0: x0 as f32,
-                cx1: (x1 + 1) as f32,
-                comp_top,
-                comp_bottom,
-                top,
-                bottom,
-                score: score_sum / cols.len().max(1) as f32,
-            };
-            clusters.push(Some(c));
-            // gap
-            let mut gx = x1 + 1;
-            while gx < w && !is_char[gx] {
-                gx += 1;
-            }
-            if gx < w && gx > x1 + 1 {
-                clusters.push(None); // space
-            }
-            x = gx.max(x1 + 1);
         }
-
-        while clusters.first().is_some_and(|c| c.is_none()) {
-            clusters.remove(0);
-        }
-        while clusters.last().is_some_and(|c| c.is_none()) {
-            clusters.pop();
-        }
-
-        // -- 4. per-cluster boxes: centre on the band, then unclip.
-        let mut chars: Vec<CharCluster> = Vec::new();
-        for slot in clusters.iter().flatten() {
-            let mut c = *slot;
-            let half = (c.height() * 0.5 * (1.0 - c.score) / 3.0).sqrt();
-            let b = Box2 {
-                x0: c.cx0,
-                y0: c.top - half,
-                x1: c.cx1,
-                y1: c.bottom + 1.0 + half,
-            }
-            .unclip(c.score);
-            let half_comp = ((c.comp_bottom - c.comp_top + 1.0) * 0.5).max(1.0);
-            let _ = half_comp;
-            c.top = b.y0;
-            c.bottom = b.y1;
-            c.cx0 = b.x0;
-            c.cx1 = b.x1;
-            c.score = c.score.min(1.0);
-            chars.push(c);
-        }
-        if chars.is_empty() {
+        let score = sum / ((x1 - x0 + 1) * (y1 - y0 + 1)) as f32;
+        if score < DET_BOX_THRESH {
             continue;
         }
-
-        // -- 5. group characters into text boxes across narrow gaps.
-        let mean_char_w: f32 =
-            chars.iter().map(|c| c.cx1 - c.cx0).sum::<f32>() / chars.len() as f32;
-        let gap_limit = 0.3 * mean_char_w;
-        let mut i = 0usize;
-        while i < chars.len() {
-            let mut j = i;
-            let mut right = chars[j].cx1;
-            while j + 1 < chars.len() && chars[j + 1].cx0 - right < gap_limit {
-                j += 1;
-                right = chars[j].cx1;
-            }
-            let group = &chars[i..=j];
-            let y0 = group.iter().map(|c| c.top).fold(f32::MAX, f32::min);
-            let y1 = group.iter().map(|c| c.bottom).fold(f32::MIN, f32::max);
-            let x0 = group.first().unwrap().cx0;
-            let x1 = group.last().unwrap().cx1;
-            let b = Box2 { x0, y0, x1, y1 };
-            if b.width() >= min_size && b.height() >= min_size {
-                boxes.push(Box2 {
-                    x0: x0 * scale_x + offset_x,
-                    y0: y0 * scale_y + offset_y,
-                    x1: x1 * scale_x + offset_x,
-                    y1: y1 * scale_y + offset_y,
-                });
-            }
-            i = j + 1;
+        let b = b.unclip(DET_UNCLIP_RATIO);
+        if b.width().min(b.height()) < DET_MIN_SIZE + 2.0 {
+            continue;
         }
+        let map = |v: f32, s: f32, max: u32| (v * s).round().clamp(0.0, max as f32);
+        let b = Box2 {
+            x0: map(b.x0, scale_x, dest_w),
+            y0: map(b.y0, scale_y, dest_h),
+            x1: map(b.x1, scale_x, dest_w),
+            y1: map(b.y1, scale_y, dest_h),
+        };
+        // filter_tag_det_res: drop boxes 3 px or less on a side
+        if b.width() <= 3.0 || b.height() <= 3.0 {
+            continue;
+        }
+        boxes.push(b);
     }
     boxes.sort_by(|a, b| a.y0.total_cmp(&b.y0).then(a.x0.total_cmp(&b.x0)));
     boxes
@@ -377,60 +213,118 @@ pub fn fit_size(w: u32, h: u32, limit: f32, multiple: u32) -> (u32, u32) {
     (round(w), round(h))
 }
 
-/// RGBA crop -> normalized NCHW f32 tensor.
-///
-/// With `target` set the crop is scaled to fit and letterboxed into
-/// `(w, h)` using `pad` as the background; otherwise the crop is scaled so its
-/// longer side is `max_side`.
-pub fn to_tensor(
-    img: &RgbaImage,
-    target: Option<(u32, u32)>,
-    max_side: f32,
-    pad: u8,
-) -> Array4<f32> {
-    let (tw, th, scale) = match target {
-        Some((tw, th)) => {
-            let scale = (tw as f32 / img.width() as f32).min(th as f32 / img.height() as f32);
-            (tw, th, scale)
-        }
-        None => {
-            let (tw, th) = fit_size(img.width(), img.height(), max_side, 1);
-            (
-                tw,
-                th,
-                (tw as f32 / img.width() as f32).min(th as f32 / img.height() as f32),
-            )
-        }
+/// Bilinear resize matching OpenCV `cv2.resize(.., INTER_LINEAR)` (the
+/// reference implementation): half-pixel centres, edge clamping, no
+/// antialiasing, rounded back to `u8`.
+pub fn resize_linear(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    let (sw, sh) = (img.width(), img.height());
+    if (sw, sh) == (w, h) {
+        return img.clone();
+    }
+    // (index, weight) of the lower source sample for each destination column
+    let axis = |dst: u32, src: u32| -> Vec<(u32, f32)> {
+        let scale = src as f64 / dst as f64;
+        (0..dst)
+            .map(|d| {
+                let pos = (d as f64 + 0.5) * scale - 0.5;
+                let mut i = pos.floor();
+                let mut f = pos - i;
+                if i < 0.0 {
+                    i = 0.0;
+                    f = 0.0;
+                }
+                if i >= (src - 1) as f64 {
+                    i = (src - 1) as f64;
+                    f = 0.0;
+                }
+                (i as u32, f as f32)
+            })
+            .collect()
     };
-    let resized = if (scale - 1.0).abs() > 0.01 {
-        let rw = ((img.width() as f32 * scale).round() as u32).max(1);
-        let rh = ((img.height() as f32 * scale).round() as u32).max(1);
-        image::imageops::resize(img, rw, rh, FilterType::Triangle)
-    } else {
-        img.clone()
-    };
-    let (tw, th) = (tw as usize, th as usize);
-    let mut data = Array4::<f32>::zeros((1, 3, th, tw));
-    for (y, row) in resized.rows().enumerate() {
-        let y = y.min(th - 1);
-        for (x, px) in row.enumerate() {
-            let x = x.min(tw - 1);
-            // RapidOCR ONNX: BGR, scale to [0,1] then (v - 0.5) / 0.5
-            // pad is used for letterboxed background
-            let b = (px.0[0] as f32 - pad as f32) / 255.0;
-            let g = (px.0[1] as f32 - pad as f32) / 255.0;
-            let r = (px.0[2] as f32 - pad as f32) / 255.0;
-            data[[0, 0, y, x]] = (b - 0.5) / 0.5;
-            data[[0, 1, y, x]] = (g - 0.5) / 0.5;
-            data[[0, 2, y, x]] = (r - 0.5) / 0.5;
+    let xs = axis(w, sw);
+    let ys = axis(h, sh);
+    let mut out = RgbaImage::new(w, h);
+    for (y, &(y0, fy)) in ys.iter().enumerate() {
+        let y1 = (y0 + 1).min(sh - 1);
+        for (x, &(x0, fx)) in xs.iter().enumerate() {
+            let x1 = (x0 + 1).min(sw - 1);
+            let (p00, p01) = (img.get_pixel(x0, y0).0, img.get_pixel(x1, y0).0);
+            let (p10, p11) = (img.get_pixel(x0, y1).0, img.get_pixel(x1, y1).0);
+            let mut px = [0u8; 4];
+            for c in 0..4 {
+                let top = p00[c] as f32 * (1.0 - fx) + p01[c] as f32 * fx;
+                let bottom = p10[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+                px[c] = (top * (1.0 - fy) + bottom * fy).round().clamp(0.0, 255.0) as u8;
+            }
+            out.put_pixel(x as u32, y as u32, image::Rgba(px));
         }
     }
+    out
+}
+
+/// Write `img` into the top-left corner of a `[3, H, W]` tensor slice,
+/// normalized as `(v / 255 - 0.5) / 0.5`.
+///
+/// Channel order is BGR: RapidOCR loads images with OpenCV, so the models are
+/// fed B, G, R (an `RgbaImage` pixel is `[R, G, B, A]`). Cells outside the
+/// image are left untouched, so padding stays `0.0` after normalization, as
+/// in PaddleOCR.
+pub fn write_normalized(img: &RgbaImage, mut out: ndarray::ArrayViewMut3<f32>) {
+    let (th, tw) = (out.shape()[1], out.shape()[2]);
+    for (x, y, px) in img.enumerate_pixels() {
+        let (x, y) = (x as usize, y as usize);
+        if x >= tw || y >= th {
+            continue;
+        }
+        let [r, g, b, _] = px.0;
+        for (c, v) in [b, g, r].into_iter().enumerate() {
+            out[[c, y, x]] = (v as f32 / 255.0 - 0.5) / 0.5;
+        }
+    }
+}
+
+/// RGBA image -> normalized `[1, 3, H, W]` tensor.
+///
+/// With `target` set the image is scaled to fit (aspect kept) and placed in
+/// the top-left of a `(w, h)` tensor, the rest being zero padding; otherwise
+/// it is scaled so its longer side is at most `max_side`.
+pub fn to_tensor(img: &RgbaImage, target: Option<(u32, u32)>, max_side: f32) -> Array4<f32> {
+    let (tw, th) = target.unwrap_or_else(|| fit_size(img.width(), img.height(), max_side, 1));
+    let scale = (tw as f32 / img.width() as f32).min(th as f32 / img.height() as f32);
+    let rw = ((img.width() as f32 * scale).round() as u32).clamp(1, tw);
+    let rh = ((img.height() as f32 * scale).round() as u32).clamp(1, th);
+    let resized = resize_linear(img, rw, rh);
+    let mut data = Array4::<f32>::zeros((1, 3, th as usize, tw as usize));
+    write_normalized(&resized, data.index_axis_mut(ndarray::Axis(0), 0));
     data
+}
+
+/// Width/height ratio the recognizer batch is at least as wide as
+/// (RapidOCR `rec_img_shape = [3, 48, 320]`).
+const REC_MIN_RATIO: f64 = 320.0 / REC_HEIGHT as f64;
+
+/// Recognition input for one batch, as RapidOCR `resize_norm_img`: every crop
+/// is resized to height 48 and width `ceil(48 * w / h)`, capped at the batch
+/// width `int(48 * max_ratio)`, then padded on the right with zeros.
+pub fn rec_batch_tensor(crops: &[&RgbaImage]) -> Array4<f32> {
+    let ratio = |c: &RgbaImage| c.width() as f64 / c.height().max(1) as f64;
+    let max_ratio = crops.iter().map(|c| ratio(c)).fold(REC_MIN_RATIO, f64::max);
+    let batch_w = (REC_HEIGHT as f64 * max_ratio) as usize;
+    let mut batch = Array4::<f32>::zeros((crops.len(), 3, REC_HEIGHT, batch_w));
+    for (slot, crop) in crops.iter().enumerate() {
+        let w = ((REC_HEIGHT as f64 * ratio(crop)).ceil() as usize).clamp(1, batch_w);
+        let resized = resize_linear(crop, w as u32, REC_HEIGHT as u32);
+        write_normalized(&resized, batch.index_axis_mut(ndarray::Axis(0), slot));
+    }
+    batch
 }
 
 // ---------------------------------------------------------------------------
 // CTC decode
 // ---------------------------------------------------------------------------
+
+/// CTC blank class (PaddleOCR puts it first).
+const CTC_BLANK: usize = 0;
 
 /// One recognized segment: text plus mean probability over kept steps.
 #[derive(Debug, Clone)]
@@ -439,14 +333,10 @@ pub struct Decoded {
     pub conf: f32,
 }
 
-/// Greedy CTC decode: argmax per timestep, collapse repeats, drop blanks.
-pub fn ctc_greedy_decode(
-    probs: &[f32],
-    timesteps: usize,
-    classes: usize,
-    blank: usize,
-    dict: &HashMap<usize, String>,
-) -> Decoded {
+/// Greedy CTC decode: argmax per timestep, collapse repeats, drop blanks
+/// (index 0). `labels` comes from [`models::ctc_labels`].
+pub fn ctc_greedy_decode(probs: &[f32], timesteps: usize, labels: &[String]) -> Decoded {
+    let classes = labels.len();
     let mut out = String::new();
     let mut kept_sum = 0f32;
     let mut kept = 0u32;
@@ -459,17 +349,12 @@ pub fn ctc_greedy_decode(
                 best = i;
             }
         }
-        let p = row[best];
-        if best != prev {
-            if best != blank {
-                if let Some(s) = dict.get(&best) {
-                    out.push_str(s);
-                }
-                kept_sum += p;
-                kept += 1;
-            }
-            prev = best;
+        if best != prev && best != CTC_BLANK {
+            out.push_str(&labels[best]);
+            kept_sum += row[best];
+            kept += 1;
         }
+        prev = best;
     }
     Decoded {
         text: out,
@@ -481,72 +366,65 @@ pub fn ctc_greedy_decode(
     }
 }
 
-/// index -> label map; the blank is the highest index and is never returned.
-fn dict_map(classes: &[String]) -> OcrResult<HashMap<usize, String>> {
-    let blank = classes.len() - 1;
-    let mut map = HashMap::with_capacity(blank);
-    for (i, c) in classes.iter().enumerate().take(blank) {
-        map.insert(i, c.clone());
-    }
-    if !classes[blank].is_empty() {
-        return Err(OcrError::Model("blank label must be empty".into()));
-    }
-    Ok(map)
-}
-
 // ---------------------------------------------------------------------------
 // recognizer
 // ---------------------------------------------------------------------------
 
 struct Recognizer {
     session: Session,
-    classes: usize,
-    dict: HashMap<usize, String>,
+    labels: Vec<String>,
 }
 
 impl Recognizer {
     fn load(model: &Path, dict_path: &Path, threads: usize) -> OcrResult<Recognizer> {
-        let labels = models::load_dictionary(dict_path)?;
-        let expected = expected_classes(model.file_name().and_then(|n| n.to_str()).unwrap_or(""));
-        if labels.len() != expected {
+        let labels = models::ctc_labels(models::load_dictionary(dict_path)?);
+        let session = build_session(model, threads)?;
+        let classes = session
+            .outputs()
+            .first()
+            .and_then(|o| o.dtype().tensor_shape())
+            .and_then(|s| s.last().copied())
+            .unwrap_or(-1);
+        if classes > 0 && classes as usize != labels.len() {
             return Err(OcrError::Model(format!(
-                "dictionary {} has {} entries (blank included), model expects {expected}",
+                "dictionary {} gives {} classes (blank + {} + space), model {} outputs {classes}",
                 dict_path.display(),
-                labels.len()
+                labels.len(),
+                labels.len() - 2,
+                model.display()
             )));
         }
-        let dict = dict_map(&labels)?;
-        let classes = labels.len();
-        Ok(Recognizer {
-            session: build_session(model, threads)?,
-            classes,
-            dict,
-        })
+        Ok(Recognizer { session, labels })
     }
 
-    /// Recognize a batch of crops; one [`Decoded`] per crop, in input order.
+    /// Recognize crops; one [`Decoded`] per crop, in input order.
+    ///
+    /// As in RapidOCR, crops are sorted by aspect ratio and run in batches of
+    /// [`REC_MAX_BATCH`] so each batch needs little padding.
     fn recognize(&mut self, crops: &[RgbaImage]) -> OcrResult<Vec<Decoded>> {
-        if crops.is_empty() {
-            return Ok(vec![]);
-        }
-        let n = crops.len();
-        // PaddleOCR sorts by width so padding is minimal, then restores order.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by_key(|&i| crops[i].width());
-        let widest = order.iter().map(|&i| crops[i].width()).max().unwrap_or(1);
-        let max_w = (widest as f32 / 8.0).ceil() as u32 * 8;
-        let mut batch = Array4::<f32>::zeros((n, 3, REC_HEIGHT, max_w as usize));
-        for (slot, &i) in order.iter().enumerate() {
-            let t = to_tensor(&crops[i], Some((max_w, REC_HEIGHT as u32)), 0.0, REC_PAD);
-            for c in 0..3 {
-                for y in 0..REC_HEIGHT {
-                    for x in 0..max_w as usize {
-                        batch[[slot, c, y, x]] =
-                            t[[0, c, y.min(t.shape()[2] - 1), x.min(t.shape()[3] - 1)]];
-                    }
-                }
+        let ratio = |c: &RgbaImage| c.width() as f64 / c.height().max(1) as f64;
+        let mut order: Vec<usize> = (0..crops.len()).collect();
+        order.sort_by(|&a, &b| ratio(&crops[a]).total_cmp(&ratio(&crops[b])));
+        let mut out = vec![
+            Decoded {
+                text: String::new(),
+                conf: 0.0
+            };
+            crops.len()
+        ];
+        for chunk in order.chunks(REC_MAX_BATCH) {
+            let batch: Vec<&RgbaImage> = chunk.iter().map(|&i| &crops[i]).collect();
+            let decoded = self.run_batch(&batch)?;
+            for (&i, d) in chunk.iter().zip(decoded) {
+                out[i] = d;
             }
         }
+        Ok(out)
+    }
+
+    fn run_batch(&mut self, crops: &[&RgbaImage]) -> OcrResult<Vec<Decoded>> {
+        let n = crops.len();
+        let batch = rec_batch_tensor(crops);
         let outputs = self
             .session
             .run(ort::inputs![TensorRef::from_array_view(&batch)?])
@@ -555,40 +433,17 @@ impl Recognizer {
             .try_extract_tensor::<f32>()
             .map_err(|e| OcrError::Ort(e.to_string()))?;
         let dims: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
-        if dims.len() != 3 || dims[0] != n || dims[2] != self.classes {
+        if dims.len() != 3 || dims[0] != n || dims[2] != self.labels.len() {
             return Err(OcrError::Ort(format!(
                 "rec output shape {dims:?} != [{n}, time, {}]",
-                self.classes
+                self.labels.len()
             )));
         }
-        let (steps, classes) = (dims[1], dims[2]);
-        let mut out = vec![
-            Decoded {
-                text: String::new(),
-                conf: 0.0
-            };
-            n
-        ];
-        for (slot, &i) in order.iter().enumerate() {
-            let start = slot * steps * classes;
-            out[i] = ctc_greedy_decode(
-                &data[start..start + steps * classes],
-                steps,
-                classes,
-                self.classes - 1,
-                &self.dict,
-            );
-        }
-        Ok(out)
-    }
-}
-
-/// Number of CTC classes the given recognition model outputs.
-fn expected_classes(name: &str) -> usize {
-    if name.contains("arabic") {
-        163
-    } else {
-        97
+        let steps = dims[1];
+        let per = steps * dims[2];
+        Ok((0..n)
+            .map(|slot| ctc_greedy_decode(&data[slot * per..(slot + 1) * per], steps, &self.labels))
+            .collect())
     }
 }
 
@@ -648,7 +503,7 @@ impl PaddleOcrEngine {
             img.clone()
         };
         let (w, h) = fit_size(src.width(), src.height(), DET_SIZE as f32, DET_MULTIPLE);
-        let tensor = to_tensor(&src, Some((w, h)), 0.0, 0);
+        let tensor = to_tensor(&src, Some((w, h)), 0.0);
         let outputs = self
             .det
             .run(ort::inputs![TensorRef::from_array_view(&tensor)?])
@@ -663,42 +518,32 @@ impl PaddleOcrEngine {
             )));
         }
         let (ph, pw) = (dims[2], dims[3]);
-        let scale = src.width() as f32 / pw as f32;
         let prob = Array4::from_shape_vec((1, 1, ph, pw), data.to_vec())
             .map_err(|e| OcrError::Ort(e.to_string()))?;
-        let mut boxes = boxes_from_probability(&prob, scale, scale, 0.0, 0.0, DET_MIN_SIZE);
-        if small {
-            for b in boxes.iter_mut() {
-                b.x0 /= 2.0;
-                b.y0 /= 2.0;
-                b.x1 /= 2.0;
-                b.y1 /= 2.0;
-            }
-        }
-        Ok(boxes)
+        // the image fills the top-left of the letterboxed input at this scale
+        let fit = (w as f32 / src.width() as f32).min(h as f32 / src.height() as f32);
+        let up = if small { 2.0 } else { 1.0 };
+        let scale = 1.0 / (fit * up);
+        Ok(boxes_from_probability(
+            &prob,
+            scale * w as f32 / pw as f32,
+            scale * h as f32 / ph as f32,
+            img.width(),
+            img.height(),
+        ))
     }
 
-    /// Crop a box with a small margin, clipped to the image.
+    /// Crop a detected box. Boxes are upright with integer corners, so this is
+    /// what RapidOCR's perspective crop produces for them.
     fn crop_box(img: &RgbaImage, b: &Box2) -> RgbaImage {
-        let pad_x = (b.width() * 0.02).max(1.0);
-        let pad_y = (b.height() * 0.02).max(1.0);
-        let w = img.width() as i32;
-        let h = img.height() as i32;
-        let x0 = (b.x0 - pad_x).floor().max(0.0) as i32;
-        let y0 = (b.y0 - pad_y).floor().max(0.0) as i32;
-        let x1 = ((b.x1 + pad_x).ceil() as i32).min(w).max(x0 + 1);
-        let y1 = ((b.y1 + pad_y).ceil() as i32).min(h).max(y0 + 1);
-        let (x0, y0, x1, y1) = (x0 as u32, y0 as u32, x1 as u32, y1 as u32);
-        let mut img_clone = img.clone();
-        crop(&mut img_clone, x0, y0, x1 - x0, y1 - y0).to_image()
+        let r = b.to_rect(img.width(), img.height());
+        let x = (r.x as u32).min(img.width() - 1);
+        let y = (r.y as u32).min(img.height() - 1);
+        crop_imm(img, x, y, r.w.max(1), r.h.max(1)).to_image()
     }
 
     fn recognize_crops(rec: &mut Recognizer, crops: &[RgbaImage]) -> OcrResult<Vec<Decoded>> {
-        let mut out = Vec::with_capacity(crops.len());
-        for chunk in crops.chunks(REC_MAX_BATCH) {
-            out.extend(rec.recognize(chunk)?);
-        }
-        Ok(out)
+        rec.recognize(crops)
     }
 
     fn to_lines(decoded: Vec<Decoded>, rects: Vec<Rect>, rtl: bool) -> Vec<OcrLine> {
@@ -715,6 +560,7 @@ impl PaddleOcrEngine {
     }
 
     fn finish(lines: Vec<OcrLine>, script: Script, start: Instant) -> OcrResultData {
+        let lines = layout::join_rows(lines);
         let text = lines
             .iter()
             .map(|l| l.text.trim())
@@ -824,67 +670,123 @@ mod tests {
         assert_eq!(h % 32, 0);
     }
 
+    fn labels(dict: &[&str]) -> Vec<String> {
+        models::ctc_labels(dict.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
     fn test_ctc_greedy_decode_collapses_repeats() {
-        let classes = vec!["a".to_string(), "b".to_string(), String::new()];
-        let dict = dict_map(&classes).unwrap();
-        // t0=a t1=a t2=blank t3=b t4=b
+        // classes: 0 = blank, 1 = "a", 2 = "b", 3 = " "
+        let labels = labels(&["a", "b"]);
+        // t0=a t1=a t2=blank t3=b t4=b t5=space t6=a
         let probs = vec![
-            0.90, 0.05, 0.05, //
-            0.90, 0.05, 0.05, //
-            0.05, 0.05, 0.90, //
-            0.10, 0.85, 0.05, //
-            0.10, 0.85, 0.05,
+            0.05, 0.90, 0.05, 0.00, //
+            0.05, 0.90, 0.05, 0.00, //
+            0.90, 0.05, 0.05, 0.00, //
+            0.05, 0.10, 0.85, 0.00, //
+            0.05, 0.10, 0.85, 0.00, //
+            0.10, 0.10, 0.00, 0.80, //
+            0.10, 0.70, 0.10, 0.10,
         ];
-        let d = ctc_greedy_decode(&probs, 5, 3, 2, &dict);
-        assert_eq!(d.text, "ab");
-        assert!((d.conf - 0.875).abs() < 1e-4, "conf {}", d.conf);
+        let d = ctc_greedy_decode(&probs, 7, &labels);
+        assert_eq!(d.text, "ab a");
+        assert!((d.conf - 0.8125).abs() < 1e-4, "conf {}", d.conf);
+    }
+
+    #[test]
+    fn test_ctc_greedy_decode_blank_splits_repeats() {
+        // "a" blank "a" is two letters; "a" "a" is one
+        let labels = labels(&["a"]);
+        let probs = vec![
+            0.1, 0.9, 0.0, //
+            0.9, 0.1, 0.0, //
+            0.1, 0.9, 0.0,
+        ];
+        assert_eq!(ctc_greedy_decode(&probs, 3, &labels).text, "aa");
     }
 
     #[test]
     fn test_ctc_greedy_decode_all_blank() {
-        let classes = vec!["a".to_string(), String::new()];
-        let dict = dict_map(&classes).unwrap();
-        let d = ctc_greedy_decode(&[0.1, 0.9, 0.1, 0.9], 2, 2, 1, &dict);
+        let labels = labels(&["a"]);
+        let d = ctc_greedy_decode(&[0.9, 0.1, 0.0, 0.9, 0.1, 0.0], 2, &labels);
         assert_eq!(d.text, "");
         assert_eq!(d.conf, 0.0);
     }
 
     #[test]
-    fn test_dict_map_rejects_non_empty_blank() {
-        assert!(dict_map(&["a".to_string(), "x".to_string()]).is_err());
+    fn test_ctc_decode_uses_dictionary_file_order() {
+        // an unsorted dictionary must decode by file position, not sort order
+        let labels = labels(&["z", "a", "m"]);
+        let mut probs = vec![0.0; 3 * 5];
+        for (t, class) in [1usize, 2, 3].into_iter().enumerate() {
+            probs[t * 5 + class] = 1.0;
+        }
+        assert_eq!(ctc_greedy_decode(&probs, 3, &labels).text, "zam");
     }
 
     #[test]
-    fn test_expected_classes() {
-        assert_eq!(expected_classes("rec_arabic.onnx"), 163);
-        assert_eq!(expected_classes("rec_latin.onnx"), 97);
+    fn test_write_normalized_is_bgr_and_scaled() {
+        let img = RgbaImage::from_pixel(2, 1, Rgba([255, 0, 51, 255]));
+        let mut t = Array4::<f32>::zeros((1, 3, 1, 2));
+        write_normalized(&img, t.index_axis_mut(ndarray::Axis(0), 0));
+        // channel 0 = B, 1 = G, 2 = R; (v / 255 - 0.5) / 0.5
+        assert!((t[[0, 0, 0, 0]] - (0.2 - 0.5) / 0.5).abs() < 1e-6);
+        assert!((t[[0, 1, 0, 0]] + 1.0).abs() < 1e-6);
+        assert!((t[[0, 2, 0, 0]] - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_to_tensor_letterbox_pads_with_pad_value() {
-        // 10x40 crop into a 48x48 target → narrow → padded horizontally
-        // scale = min(48/10, 48/40) = 1.2, resized = 12x48
+    fn test_rec_batch_tensor_resize_and_zero_padding() {
+        // 20x10 -> ratio 2 -> 96 px wide; batch width is at least 320
+        let small = RgbaImage::from_pixel(20, 10, Rgba([255, 255, 255, 255]));
+        let t = rec_batch_tensor(&[&small]);
+        assert_eq!(t.shape(), &[1, 3, 48, 320]);
+        assert!((t[[0, 0, 24, 95]] - 1.0).abs() < 1e-6, "white inside");
+        assert_eq!(t[[0, 0, 24, 96]], 0.0, "padding stays 0");
+        assert_eq!(t[[0, 2, 47, 319]], 0.0);
+
+        // the widest crop sets the batch width: int(48 * 1000 / 30) = 1600
+        let wide = RgbaImage::from_pixel(1000, 30, Rgba([0, 0, 0, 255]));
+        let t = rec_batch_tensor(&[&small, &wide]);
+        assert_eq!(t.shape(), &[2, 3, 48, 1600]);
+        assert!((t[[1, 1, 0, 1599]] + 1.0).abs() < 1e-6, "black to the edge");
+        assert_eq!(t[[0, 1, 0, 96]], 0.0);
+        // width = ceil(48 * 7 / 5) = 68
+        let odd = RgbaImage::from_pixel(7, 5, Rgba([255, 255, 255, 255]));
+        let t = rec_batch_tensor(&[&odd]);
+        assert!(t[[0, 0, 0, 67]] > 0.99);
+        assert_eq!(t[[0, 0, 0, 68]], 0.0);
+    }
+
+    #[test]
+    fn test_resize_linear_matches_opencv() {
+        // cv2.resize(np.array([[0, 100, 200, 250]], np.uint8), (8, 1))
+        //   -> [0, 25, 75, 125, 175, 213, 238, 250]
+        let mut img = RgbaImage::new(4, 1);
+        for (x, v) in [0u8, 100, 200, 250].into_iter().enumerate() {
+            img.put_pixel(x as u32, 0, Rgba([v, v, v, 255]));
+        }
+        let out = resize_linear(&img, 8, 1);
+        let got: Vec<u8> = out.pixels().map(|p| p.0[0]).collect();
+        assert_eq!(got, [0, 25, 75, 125, 175, 213, 238, 250]);
+    }
+
+    #[test]
+    fn test_to_tensor_letterbox_pads_with_zero() {
+        // 10x40 into 48x48: scale 1.2 -> 12x48, the rest is padding
         let img = RgbaImage::from_pixel(10, 40, Rgba([255, 255, 255, 255]));
-        let t = to_tensor(&img, Some((48, 48)), 0.0, REC_PAD);
+        let t = to_tensor(&img, Some((48, 48)), 0.0);
         assert_eq!(t.shape(), &[1, 3, 48, 48]);
-        // y=10, x=0 is within resized image
-        // (255-127)/255 = 0.502, normalized: (0.502-0.5)/0.5 ≈ 0.004
-        let pixel = t[[0, 0, 10, 0]];
-        assert!(
-            pixel.abs() < 0.1,
-            "pixel at [0,0,10,0] should be near 0 for white with pad=127, got {pixel}"
-        );
+        assert!((t[[0, 0, 10, 0]] - 1.0).abs() < 1e-6, "white is +1");
+        assert_eq!(t[[0, 0, 10, 20]], 0.0, "padding stays 0");
     }
 
     #[test]
     fn test_to_tensor_no_target_uses_original_size() {
-        // target=None with max_side=640: fit_size returns image as-is when below limit
         let img = RgbaImage::from_pixel(100, 50, Rgba([0, 0, 0, 255]));
-        let t = to_tensor(&img, None, 640.0, 0);
-        // fit_size clamps ratio to 1.0 when image is smaller than max_side, so no upscaling
+        let t = to_tensor(&img, None, 640.0);
         assert_eq!(t.shape(), &[1, 3, 50, 100]);
-        // with (v/255 - 0.5) / 0.5, black (0,0,0) becomes -1
+        // black becomes -1
         assert!((t[[0, 0, 10, 10]] + 1.0).abs() < 1e-6);
     }
 
@@ -908,17 +810,24 @@ mod tests {
     }
 
     #[test]
-    fn test_box2_unclip_grows() {
+    fn test_box2_unclip_grows_by_area_over_perimeter() {
         let b = Box2 {
             x0: 0.0,
             y0: 0.0,
-            x1: 10.0,
+            x1: 30.0,
             y1: 10.0,
         };
-        let u = b.unclip(0.5);
-        assert!(u.width() > b.width() && u.height() > b.height());
-        // score 1 → no expansion
-        assert_eq!(b.unclip(1.0), b);
+        // d = 30 * 10 * 1.6 / 80 = 6
+        let u = b.unclip(1.6);
+        assert_eq!(
+            u,
+            Box2 {
+                x0: -6.0,
+                y0: -6.0,
+                x1: 36.0,
+                y1: 16.0
+            }
+        );
     }
 
     #[test]
@@ -942,37 +851,56 @@ mod tests {
     }
 
     #[test]
-    fn test_boxes_from_probability_finds_two_blocks() {
-        // 40x40 map, two solid 10x8 blocks at y=4 and y=24
-        let mut prob = Array4::<f32>::zeros((1, 1, 40, 40));
+    fn test_boxes_from_probability_finds_two_lines() {
+        // 60x40 map, two solid lines at y=4..12 and y=24..32
+        let mut prob = Array4::<f32>::zeros((1, 1, 40, 60));
         for y in 4..12 {
-            for x in 5..25 {
+            for x in 5..45 {
                 prob[[0, 0, y, x]] = 0.9;
             }
         }
         for y in 24..32 {
-            for x in 10..20 {
+            for x in 10..30 {
                 prob[[0, 0, y, x]] = 0.9;
             }
         }
-        let boxes = boxes_from_probability(&prob, 1.0, 1.0, 0.0, 0.0, DET_MIN_SIZE);
-        // boxes_from_probability is complex; just verify it runs without panic
-        let _ = boxes.len();
+        let boxes = boxes_from_probability(&prob, 1.0, 1.0, 60, 40);
+        assert_eq!(boxes.len(), 2, "{boxes:?}");
+        // first region after dilation: x 5..=45, y 4..=12 -> 40x8,
+        // d = 40 * 8 * 1.6 / 96 = 5.33, rounded and clipped at 0
+        assert_eq!(
+            (boxes[0].x0, boxes[0].y0, boxes[0].x1, boxes[0].y1),
+            (0.0, 0.0, 50.0, 17.0)
+        );
+        assert!(boxes[1].y0 > boxes[0].y1);
     }
 
     #[test]
-    fn test_boxes_from_probability_merges_across_small_gap() {
-        // two blocks separated by 2 px: one text box
+    fn test_boxes_from_probability_drops_weak_and_tiny_regions() {
         let mut prob = Array4::<f32>::zeros((1, 1, 30, 30));
-        for y in 8..16 {
-            for x in 2..8 {
-                prob[[0, 0, y, x]] = 0.9;
-            }
-            for x in 10..16 {
-                prob[[0, 0, y, x]] = 0.9;
+        // above the binarization threshold but below the box threshold
+        for y in 2..10 {
+            for x in 2..20 {
+                prob[[0, 0, y, x]] = 0.4;
             }
         }
-        let boxes = boxes_from_probability(&prob, 1.0, 1.0, 0.0, 0.0, DET_MIN_SIZE);
-        let _ = boxes.len();
+        // a 2x2 speck
+        prob[[0, 0, 20, 20]] = 0.9;
+        prob[[0, 0, 21, 21]] = 0.9;
+        assert!(boxes_from_probability(&prob, 1.0, 1.0, 30, 30).is_empty());
+    }
+
+    #[test]
+    fn test_boxes_from_probability_scales_and_clips() {
+        let mut prob = Array4::<f32>::zeros((1, 1, 20, 40));
+        for y in 5..15 {
+            for x in 0..40 {
+                prob[[0, 0, y, x]] = 0.95;
+            }
+        }
+        let boxes = boxes_from_probability(&prob, 2.0, 2.0, 80, 40);
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].x0, 0.0);
+        assert_eq!(boxes[0].x1, 80.0);
     }
 }

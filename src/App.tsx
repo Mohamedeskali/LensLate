@@ -33,14 +33,54 @@ type CaptureEvent =
     }
   | { type: "error"; message: string };
 
+type OcrScript = "auto" | "latin" | "arabic";
+
+type OcrLine = {
+  text: string;
+  conf: number;
+  rtl: boolean;
+};
+
+type OcrResult = {
+  lines: OcrLine[];
+  text: string;
+  ms: number;
+  script: OcrScript;
+};
+
+type ModelsEvent = {
+  state: "missing" | "downloading" | "ready" | "error";
+  progress: number | null;
+  message: string | null;
+};
+
+const SCRIPTS: OcrScript[] = ["auto", "latin", "arabic"];
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // WebKitGTK may refuse the async clipboard API; fall back to a selection.
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+}
+
 const geometryStore = new LazyStore("window-state.json");
 
 function App() {
   const { t, i18n } = useTranslation();
   const [hovered, setHovered] = useState(false);
   const [live, setLive] = useState(false);
-  const [thumbnail, setThumbnail] = useState<string | null>(null);
-  const [captureInfo, setCaptureInfo] = useState<string>("");
+  const [ocr, setOcr] = useState<OcrResult | null>(null);
+  const [reading, setReading] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [script, setScript] = useState<OcrScript>("auto");
+  const [models, setModels] = useState<ModelsEvent | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const view = new URLSearchParams(window.location.search).get("view");
   const windowHandle = getCurrentWindow();
@@ -61,22 +101,30 @@ function App() {
     });
   };
 
-  const handleCaptureOnce = async () => {
+  const handleOcrOnce = async () => {
     setErrorMsg(null);
+    setReading(true);
     try {
-      const result = await invoke<CaptureEvent>("capture_once");
-      if (result.type === "frame") {
-        setThumbnail(result.thumbnailPngBase64);
-        setCaptureInfo(
-          `${result.width}×${result.height} px · ${result.ms} ms${result.skipped ? ` · skipped ${result.skipped}` : ""}`,
-        );
-      } else {
-        setErrorMsg(t("captureError", { message: result.message }));
-        setCaptureInfo("");
-      }
+      setOcr(await invoke<OcrResult>("ocr_once"));
     } catch (e) {
-      setErrorMsg(t("captureError", { message: String(e) }));
+      setErrorMsg(t("ocrError", { message: String(e) }));
+    } finally {
+      setReading(false);
     }
+  };
+
+  const handleScriptChange = (next: OcrScript) => {
+    setScript(next);
+    void invoke("set_ocr_script", { script: next }).catch((e: unknown) =>
+      setErrorMsg(t("ocrError", { message: String(e) })),
+    );
+  };
+
+  const handleCopy = async () => {
+    if (!ocr?.text) return;
+    await copyText(ocr.text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
   };
 
   const handleLiveToggle = async () => {
@@ -189,29 +237,12 @@ function App() {
     };
   }, [view, windowHandle]);
 
-  // Listen for live capture events
+  // Listen for live capture and OCR events
   useEffect(() => {
     if (view !== "frame") return;
 
-    let unlistenFrame: (() => void) | null = null;
-    let unlistenError: (() => void) | null = null;
-    let unlistenStopped: (() => void) | null = null;
-
-    const setupListeners = async () => {
-      unlistenFrame = await listen<CaptureEvent>(
-        "capture://frame",
-        (event: TauriEvent<CaptureEvent>) => {
-          const payload = event.payload;
-          if (payload.type === "frame") {
-            setThumbnail(payload.thumbnailPngBase64);
-            setCaptureInfo(
-              `${payload.width}×${payload.height} px · ${payload.ms} ms${payload.skipped ? ` · skipped ${payload.skipped}` : ""}`,
-            );
-          }
-        },
-      );
-
-      unlistenError = await listen<CaptureEvent>(
+    const unlisteners = [
+      listen<CaptureEvent>(
         "capture://error",
         (event: TauriEvent<CaptureEvent>) => {
           const payload = event.payload;
@@ -219,18 +250,21 @@ function App() {
             setErrorMsg(t("captureError", { message: payload.message }));
           }
         },
-      );
-
+      ),
       // Backend stops live capture by itself when the frame is hidden.
-      unlistenStopped = await listen("capture://stopped", () => setLive(false));
-    };
-
-    setupListeners();
+      listen("capture://stopped", () => setLive(false)),
+      listen<OcrResult>("ocr://result", ({ payload }) => {
+        setErrorMsg(null);
+        setOcr(payload);
+      }),
+      listen<ModelsEvent>("ocr://models", ({ payload }) => setModels(payload)),
+      listen<{ message: string }>("ocr://error", ({ payload }) =>
+        setErrorMsg(t("ocrError", { message: payload.message })),
+      ),
+    ];
 
     return () => {
-      unlistenFrame?.();
-      unlistenError?.();
-      unlistenStopped?.();
+      for (const unlisten of unlisteners) void unlisten.then((stop) => stop());
     };
   }, [view, t]);
 
@@ -249,18 +283,17 @@ function App() {
       onMouseLeave={() => setHovered(false)}
       onMouseDown={(event) => {
         const target = event.target as HTMLElement;
+        // The recognized text stays selectable; everything else drags.
         if (
           event.button === 0 &&
           !target.closest(".resize-zone") &&
-          !target.closest("button")
-        )
+          !target.closest("button") &&
+          !target.closest("select") &&
+          !target.closest(".ocr-text")
+        ) {
           event.preventDefault();
-        if (
-          event.button === 0 &&
-          !target.closest(".resize-zone") &&
-          !target.closest("button")
-        )
           startMove();
+        }
       }}
     >
       <div
@@ -338,7 +371,8 @@ function App() {
         <button
           title={t("capture")}
           aria-label={t("capture")}
-          onClick={handleCaptureOnce}
+          onClick={handleOcrOnce}
+          disabled={reading}
         >
           文
         </button>
@@ -350,6 +384,21 @@ function App() {
         >
           {live ? "⏸" : "▶"}
         </button>
+        <select
+          className="script-select"
+          title={t("script")}
+          aria-label={t("script")}
+          value={script}
+          onChange={(event) =>
+            handleScriptChange(event.target.value as OcrScript)
+          }
+        >
+          {SCRIPTS.map((value) => (
+            <option key={value} value={value}>
+              {t(`script_${value}`)}
+            </option>
+          ))}
+        </select>
         <button
           title={t("settings")}
           aria-label={t("settings")}
@@ -367,18 +416,47 @@ function App() {
       </nav>
 
       <div className="translation-bar">
-        {errorMsg && <span className="capture-error">{errorMsg}</span>}
-        {thumbnail && !errorMsg && (
+        {models?.state === "downloading" && (
+          <div className="models-progress" role="status">
+            <span>
+              {t("modelsDownloading", {
+                progress: Math.round((models.progress ?? 0) * 100),
+              })}
+            </span>
+            <progress max={1} value={models.progress ?? 0} />
+          </div>
+        )}
+        {models?.state === "error" && (
+          <span className="capture-error">
+            {t("modelsError", { message: models.message ?? "" })}
+          </span>
+        )}
+        {errorMsg && models?.state !== "error" && (
+          <span className="capture-error">{errorMsg}</span>
+        )}
+        {!errorMsg && models?.state !== "downloading" && (
           <>
-            <img
-              src={`data:image/png;base64,${thumbnail}`}
-              alt="Capture thumbnail"
-              className="capture-thumbnail"
-            />
-            <span className="capture-info">{captureInfo}</span>
+            <div className="ocr-text" aria-live="polite">
+              {reading && !ocr && <span>{t("reading")}</span>}
+              {!reading && !ocr && <span>{t("translationPlaceholder")}</span>}
+              {ocr && ocr.lines.length === 0 && <span>{t("noText")}</span>}
+              {ocr?.lines.map((line, index) => (
+                <div key={index} dir={line.rtl ? "rtl" : "ltr"}>
+                  {line.text}
+                </div>
+              ))}
+            </div>
+            {ocr && ocr.text && (
+              <button
+                className="copy-button"
+                title={t("copy")}
+                onClick={() => void handleCopy()}
+              >
+                {copied ? t("copied") : t("copy")}
+              </button>
+            )}
           </>
         )}
-        {!thumbnail && !errorMsg && <span>{t("translationPlaceholder")}</span>}
       </div>
     </main>
   );
