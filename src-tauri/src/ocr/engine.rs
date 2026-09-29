@@ -572,6 +572,9 @@ impl PaddleOcrEngine {
             text,
             ms: start.elapsed().as_millis() as u64,
             script,
+            width: 0,
+            height: 0,
+            colors: Vec::new(),
         }
     }
 }

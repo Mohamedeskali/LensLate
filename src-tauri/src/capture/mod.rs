@@ -3,6 +3,8 @@ use std::sync::mpsc::Sender;
 use thiserror::Error;
 
 pub mod locate;
+pub mod multi;
+pub mod overlay;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 pub mod xcap_backend;
@@ -42,19 +44,27 @@ pub enum CaptureError {
 
 pub type CaptureResult<T> = Result<T, CaptureError>;
 
+pub use multi::{Located, MonitorFrame};
+
 pub trait ScreenCapture: Send {
-    fn capture_monitor(&mut self) -> CaptureResult<RgbaImage>;
-    fn start_stream(&mut self, fps: u32, tx: Sender<RgbaImage>) -> CaptureResult<()>;
+    /// One picture of every monitor the backend can see (the portal: every
+    /// shared monitor; xcap: the monitor holding the frame window).
+    fn capture_monitors(&mut self) -> CaptureResult<Vec<MonitorFrame>>;
+    /// Stream pictures at about `fps` per monitor into `tx`.
+    fn start_stream(&mut self, fps: u32, tx: Sender<MonitorFrame>) -> CaptureResult<()>;
     fn stop_stream(&mut self);
     /// Release everything (stream, portal session) before the app quits.
     fn shutdown(&mut self) {
         self.stop_stream();
     }
+    /// Forget the chosen screens so the next capture asks again (portal).
+    fn reselect(&mut self) {}
+    /// Number of monitors being captured, when the backend is limited to a
+    /// user selection (the portal); `None` when it follows the window.
+    fn shared_monitors(&self) -> Option<usize> {
+        None
+    }
     fn is_wayland(&self) -> bool;
-}
-
-pub fn locate_frame(img: &RgbaImage, hint: Option<Rect>) -> Option<Rect> {
-    locate::locate_frame(img, hint)
 }
 
 pub fn crop_inside(img: &RgbaImage, rect: Rect, inset: u32) -> RgbaImage {
@@ -88,10 +98,10 @@ pub enum CaptureEvent {
 pub struct NoOpCapture;
 
 impl ScreenCapture for NoOpCapture {
-    fn capture_monitor(&mut self) -> CaptureResult<RgbaImage> {
+    fn capture_monitors(&mut self) -> CaptureResult<Vec<MonitorFrame>> {
         Err(CaptureError::XCap("Not initialized".into()))
     }
-    fn start_stream(&mut self, _fps: u32, _tx: Sender<RgbaImage>) -> CaptureResult<()> {
+    fn start_stream(&mut self, _fps: u32, _tx: Sender<MonitorFrame>) -> CaptureResult<()> {
         Err(CaptureError::XCap("Not initialized".into()))
     }
     fn stop_stream(&mut self) {}

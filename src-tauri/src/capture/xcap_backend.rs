@@ -1,5 +1,9 @@
-use crate::capture::{CaptureError, CaptureResult, ScreenCapture};
-use image::RgbaImage;
+//! X11 / Windows / macOS capture with xcap: the monitor holding the frame
+//! window is captured and cut to the window area; the caller then finds the
+//! marker border inside it.
+
+use crate::capture::multi::{match_monitor, pick_monitor, window_rect_in_image, MonitorInfo};
+use crate::capture::{CaptureError, CaptureResult, MonitorFrame, Rect, ScreenCapture};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -7,6 +11,38 @@ use std::thread;
 use std::time::Duration;
 use tauri::Manager;
 use xcap::Monitor;
+
+fn xcap_err(e: impl std::fmt::Display) -> CaptureError {
+    let msg = e.to_string();
+    // macOS reports a missing Screen Recording permission this way.
+    if msg.contains("permission") || msg.contains("Permission") || msg.contains("denied") {
+        CaptureError::PermissionDenied
+    } else {
+        CaptureError::XCap(msg)
+    }
+}
+
+fn xcap_info(m: &Monitor) -> CaptureResult<MonitorInfo> {
+    Ok(MonitorInfo {
+        name: m.name().map_err(xcap_err)?,
+        x: m.x().map_err(xcap_err)?,
+        y: m.y().map_err(xcap_err)?,
+        width: m.width().map_err(xcap_err)?,
+        height: m.height().map_err(xcap_err)?,
+        scale: f64::from(m.scale_factor().map_err(xcap_err)?),
+    })
+}
+
+fn tauri_info(m: &tauri::Monitor) -> MonitorInfo {
+    MonitorInfo {
+        name: m.name().cloned().unwrap_or_default(),
+        x: m.position().x,
+        y: m.position().y,
+        width: m.size().width,
+        height: m.size().height,
+        scale: m.scale_factor(),
+    }
+}
 
 pub struct XCapCapture {
     window_label: String,
@@ -27,49 +63,82 @@ impl XCapCapture {
         self.app_handle = Some(handle);
     }
 
-    fn capture_window_area(app: &tauri::AppHandle, window_label: &str) -> CaptureResult<RgbaImage> {
+    /// Capture the monitor that holds most of the frame window and cut the
+    /// window area out of it.
+    fn capture_window_area(
+        app: &tauri::AppHandle,
+        window_label: &str,
+    ) -> CaptureResult<MonitorFrame> {
         let window = app
             .get_webview_window(window_label)
             .ok_or_else(|| CaptureError::XCap("Frame window not found".into()))?;
 
-        // outer_position/inner_size are already physical pixels, like xcap's monitor space.
-        let pos = window
-            .outer_position()
-            .map_err(|e| CaptureError::XCap(e.to_string()))?;
-        let size = window
-            .inner_size()
-            .map_err(|e| CaptureError::XCap(e.to_string()))?;
+        // Tauri reports window and monitors in one physical-pixel space.
+        let pos = window.outer_position().map_err(xcap_err)?;
+        let size = window.outer_size().map_err(xcap_err)?;
+        let win = Rect {
+            x: pos.x,
+            y: pos.y,
+            w: size.width,
+            h: size.height,
+        };
+        let tauri_monitors: Vec<MonitorInfo> = window
+            .available_monitors()
+            .map_err(xcap_err)?
+            .iter()
+            .map(tauri_info)
+            .collect();
+        let index = pick_monitor(&tauri_monitors, win).ok_or(CaptureError::NoMonitor)?;
+        let target = &tauri_monitors[index];
 
-        let monitor =
-            Monitor::from_point(pos.x, pos.y).map_err(|e| CaptureError::XCap(e.to_string()))?;
-        let mon_x = monitor.x().map_err(|e| CaptureError::XCap(e.to_string()))?;
-        let mon_y = monitor.y().map_err(|e| CaptureError::XCap(e.to_string()))?;
-        let image = monitor
-            .capture_image()
-            .map_err(|e| CaptureError::XCap(e.to_string()))?;
+        // xcap may use another space (logical points on macOS); match by
+        // name, origin or size, and fall back to a point lookup.
+        let xcap_monitors = Monitor::all().map_err(xcap_err)?;
+        let infos = xcap_monitors
+            .iter()
+            .map(xcap_info)
+            .collect::<CaptureResult<Vec<_>>>()?;
+        let monitor = match match_monitor(target, &infos) {
+            Some(i) => xcap_monitors[i].clone(),
+            None => {
+                let (cx, cy) = (win.x + win.w as i32 / 2, win.y + win.h as i32 / 2);
+                Monitor::from_point(cx, cy).map_err(xcap_err)?
+            }
+        };
+        let image = monitor.capture_image().map_err(xcap_err)?;
+        let area = window_rect_in_image(win, target, image.width(), image.height())
+            .ok_or(CaptureError::NoMonitor)?;
+        let cropped =
+            image::imageops::crop_imm(&image, area.x as u32, area.y as u32, area.w, area.h)
+                .to_image();
+        Ok(MonitorFrame {
+            index,
+            name: if target.name.is_empty() {
+                format!("monitor-{index}")
+            } else {
+                target.name.clone()
+            },
+            image: cropped,
+        })
+    }
 
-        // Crop the captured monitor image to the window area
-        let x = (pos.x - mon_x).max(0) as u32;
-        let y = (pos.y - mon_y).max(0) as u32;
-        let cropped = image::imageops::crop_imm(&image, x, y, size.width, size.height).to_image();
-        if cropped.width() == 0 || cropped.height() == 0 {
-            return Err(CaptureError::NoMonitor);
-        }
-        Ok(cropped)
+    fn is_window_visible(app: &tauri::AppHandle, window_label: &str) -> bool {
+        app.get_webview_window(window_label)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
     }
 }
 
 impl ScreenCapture for XCapCapture {
-    fn capture_monitor(&mut self) -> CaptureResult<RgbaImage> {
+    fn capture_monitors(&mut self) -> CaptureResult<Vec<MonitorFrame>> {
         let app = self
             .app_handle
             .as_ref()
             .ok_or_else(|| CaptureError::XCap("No app handle".into()))?;
-
-        Self::capture_window_area(app, &self.window_label)
+        Ok(vec![Self::capture_window_area(app, &self.window_label)?])
     }
 
-    fn start_stream(&mut self, fps: u32, tx: Sender<RgbaImage>) -> CaptureResult<()> {
+    fn start_stream(&mut self, fps: u32, tx: Sender<MonitorFrame>) -> CaptureResult<()> {
         let app = self
             .app_handle
             .as_ref()
@@ -87,11 +156,13 @@ impl ScreenCapture for XCapCapture {
             {
                 let start = std::time::Instant::now();
 
-                // Send the whole window area; the caller locates the marker and crops.
-                if let Ok(image) = Self::capture_window_area(&app_handle, &window_label) {
-                    if tx.send(image).is_err() {
-                        break;
+                match Self::capture_window_area(&app_handle, &window_label) {
+                    Ok(frame) => {
+                        if tx.send(frame).is_err() {
+                            break;
+                        }
                     }
+                    Err(e) => eprintln!("[lenslate] capture error: {e}"),
                 }
 
                 let elapsed = start.elapsed();
@@ -110,13 +181,5 @@ impl ScreenCapture for XCapCapture {
 
     fn is_wayland(&self) -> bool {
         false
-    }
-}
-
-impl XCapCapture {
-    fn is_window_visible(app: &tauri::AppHandle, window_label: &str) -> bool {
-        app.get_webview_window(window_label)
-            .and_then(|w| w.is_visible().ok())
-            .unwrap_or(false)
     }
 }

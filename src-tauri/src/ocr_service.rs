@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use image::RgbaImage;
 use tauri::{AppHandle, Emitter};
 
+use crate::capture::{overlay, Rect};
 use crate::ocr::engine::PaddleOcrEngine;
 use crate::ocr::models::{self, ProgressReporter};
 use crate::ocr::{self as core, ModelState, OcrEngine, OcrEvent, OcrResultData};
@@ -87,10 +88,28 @@ pub fn recognize(app: &AppHandle, crop: &RgbaImage, retry: bool) -> Result<OcrRe
         }
     }
     let engine = engine.as_mut().expect("engine loaded above");
-    let result = engine.recognize(crop, core::ocr_script()).map_err(|e| {
+    let mut result = engine.recognize(crop, core::ocr_script()).map_err(|e| {
         eprintln!("[lenslate] ocr error: {e}");
         e.to_string()
     })?;
+    result.width = crop.width();
+    result.height = crop.height();
+    result.colors = result
+        .lines
+        .iter()
+        .map(|line| {
+            let r = line.rect;
+            overlay::line_colors(
+                crop,
+                Rect {
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
+                },
+            )
+        })
+        .collect();
     eprintln!(
         "[lenslate] ocr ms={} lines={} chars={} conf={:.2} script={}",
         result.ms,
@@ -131,15 +150,10 @@ fn spawn_worker(app: AppHandle) -> SyncSender<RgbaImage> {
         .spawn(move || {
             for crop in rx {
                 match recognize(&app, &crop, false) {
-                    Ok(r) => emit(
-                        &app,
-                        OcrEvent::Result {
-                            text: r.text,
-                            lines: r.lines,
-                            ms: r.ms,
-                            script: r.script,
-                        },
-                    ),
+                    Ok(r) => {
+                        crate::translate_service::submit_live(&r);
+                        emit(&app, OcrEvent::Result(r));
+                    }
                     Err(message) => emit(&app, OcrEvent::Error { message }),
                 }
                 BUSY.store(false, Ordering::SeqCst);
